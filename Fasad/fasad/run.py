@@ -55,30 +55,35 @@ def _draw_one(acad: Acad, system: System, obj: ObjectParams, fac: Facade, system
         m, f = map(int, acad.run_lisp(draw_items_code(it_list, colors)).split())
         made, failed = made + m, failed + f
 
-    items(build_on_facade(fac, system, obj, systems_dir))
+    from . import library as lib_mod
+    _, lib = lib_mod.load(system, systems_dir)          # блоки закладных и узлов - из одной библиотеки
+    on_items = build_on_facade(fac, system, obj, systems_dir, lib=lib)
+    sec_items, used_blocks = [], set()
     try:
-        sec_items, sec_warn, used_blocks, node_lib = build_sections(fac, system, obj, systems_dir)
+        sec_items, sec_warn, used_blocks, _ = build_sections(fac, system, obj, systems_dir)
         fac.warnings += sec_warn
-        if used_blocks and node_lib is not None:           # блоки узлов из библиотеки пользователя
-            from .library import export_blocks, load_blocks_code as lib_blocks_code
-            import time
-            # имя файла - новое на каждое построение: иначе AutoCAD спросит "переопределить блок?" и собьётся
-            tmp = Path("C:/temp") / f"fasad_uzly_{int(time.time())}.dxf"
-            tmp.parent.mkdir(parents=True, exist_ok=True)
-            sig = export_blocks(node_lib, used_blocks, tmp)
-            res = acad.run_lisp(lib_blocks_code(tmp, sig), timeout=180) or ""
-            tmp.unlink(missing_ok=True)
-            if "НЕТ:" in res:
-                fac.warnings.append("Сечение: не загрузились блоки " + res.split("НЕТ:")[1].strip())
-        elif used_blocks:                                  # детали узлов из базы каталога - определить блоки
-            from .catalog_nodes import blocks_code, load_base
-            res = acad.run_lisp(blocks_code(used_blocks, load_base(systems_dir)[1]), timeout=120) or ""
-            if "НЕ ОПРЕДЕЛЕНЫ" in res:
-                fac.warnings.append("Блоки деталей " + res.split("НЕ ОПРЕДЕЛЕНЫ:")[1].strip() +
-                                    " не удалось заменить на каталожные - в сечении могут стоять неверно")
-        items(sec_items)
     except (ValueError, KeyError, OSError) as e:
         fac.warnings.append(f"Сечения не построены: {e}")
+    need = {it.place.name for it in on_items if it.kind == "insert"} | used_blocks
+    if need and lib is not None:                        # блоки узлов и закладных из библиотеки пользователя
+        from .library import export_blocks, load_blocks_code as lib_blocks_code
+        import time
+        # имя файла - новое на каждое построение: иначе AutoCAD спросит "переопределить блок?" и собьётся
+        tmp = Path("C:/temp") / f"fasad_uzly_{int(time.time())}.dxf"
+        tmp.parent.mkdir(parents=True, exist_ok=True)
+        sig = export_blocks(lib, need, tmp)
+        res = acad.run_lisp(lib_blocks_code(tmp, sig), timeout=180) or ""
+        tmp.unlink(missing_ok=True)
+        if "НЕТ:" in res:
+            fac.warnings.append("Не загрузились блоки " + res.split("НЕТ:")[1].strip())
+    elif used_blocks:                                   # детали узлов из базы каталога - определить блоки
+        from .catalog_nodes import blocks_code, load_base
+        res = acad.run_lisp(blocks_code(used_blocks, load_base(systems_dir)[1]), timeout=120) or ""
+        if "НЕ ОПРЕДЕЛЕНЫ" in res:
+            fac.warnings.append("Блоки деталей " + res.split("НЕ ОПРЕДЕЛЕНЫ:")[1].strip() +
+                                " не удалось заменить на каталожные - в сечении могут стоять неверно")
+    items(on_items)
+    items(sec_items)
     items(build_marks(fac, system))
     d = system.card["размеры"]
     floor = min(lo for lo, hi in fac.post_ends.values()) if fac.post_ends else 0.0

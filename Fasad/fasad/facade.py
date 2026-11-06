@@ -121,7 +121,7 @@ class Facade:
     # геометрия для сечений и закладных на фасаде
     post_x: list[float] = field(default_factory=list)       # оси стоек
     post_ends: dict = field(default_factory=dict)           # ось стойки -> (низ, верх) стойки
-    beam_spans: list[tuple] = field(default_factory=list)   # (y, x_лев, x_прав, шифр закладной)
+    beam_spans: list[tuple] = field(default_factory=list)   # (y, x_лев, x_прав, шифр закладной, ригель)
     beam_art: dict = field(default_factory=dict)            # (y, x_лев, x_прав) -> артикул ригеля пролёта
     false_spans: list[tuple] = field(default_factory=list)  # фальш-ригели (y, x_лев, x_прав, артикул)
     marks: list[tuple] = field(default_factory=list)        # (y, x_лев, x_прав, марка) - по правилам, до правок таблицы
@@ -701,7 +701,7 @@ def _build(axes: list[Axis], system: System, obj: ObjectParams,
                                      f"нет закладной с отверстиями \"{rule['отверстия']}\" ({rule['способ']})") +
                                     " - подберите закладную")
         fac.fixings.append((where, wt, rule["способ"], rule["крепеж"], ins_name))
-        fac.beam_spans.append((y, xl, xr, code or ins_name))
+        fac.beam_spans.append((y, xl, xr, code or ins_name, b_art))
         fix_count[rule["крепеж"]] = fix_count.get(rule["крепеж"], 0) + zk["на_ригель"]
         ins_count[ins_name] = ins_count.get(ins_name, 0) + zk["на_ригель"]
         if rule.get("тяжелый") and not kit["Вариант"].startswith("Тяжелые"):

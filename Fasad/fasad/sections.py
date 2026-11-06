@@ -474,8 +474,13 @@ def _sections_catalog(fac: Facade, system: System, obj: ObjectParams, folder: Pa
     return items, warnings, used_blocks
 
 
-def build_on_facade(fac: Facade, system: System, obj: ObjectParams, folder: Path) -> list[Item]:
-    """Закладные ригелей (живой контур), закладные стоек, платики, подкладки - на фасаде."""
+def build_on_facade(fac: Facade, system: System, obj: ObjectParams, folder: Path,
+                    lib=None) -> list[Item]:
+    """Закладные ригелей, закладные стоек, платики, подкладки - на фасаде.
+
+    Ригельная закладная - блок своего семейства из библиотеки (точка вставки (0,0) - в плоскости
+    стойки по оси ригеля, X - вдоль ригеля; правый конец - зеркалом); если блока нет - контур
+    из _контуры.json, затем условный прямоугольник + замечание."""
     card = system.card
     zc = card["закладные_на_фасаде"]
     half = card["система"]["ширина_профиля"] / 2
@@ -486,20 +491,42 @@ def build_on_facade(fac: Facade, system: System, obj: ObjectParams, folder: Path
     sh_file = folder / f"{Path(card['сечение']['узлы']).stem.split('_')[0]}_контуры.json"
     if sh_file.exists():
         shapes = json.loads(sh_file.read_text(encoding="utf-8"))
-    shape = shapes.get(f"КП1336/{card['ригель']['артикул']}", {}).get("точки")
     L, H = zc["ригель_длина"], zc["ригель_высота"] / 2
-    for y, xl, xr, code in fac.beam_spans:
+    no_shape: set[str] = set()
+
+    def insert_form(code: str, b_art: str):
+        """Чем рисовать закладную: ('block', имя) / ('poly', точки) / (None, None) - прямоугольник."""
+        family = str(code).split("-")[0].split("_")[0]
+        if "-" not in str(code):        # закладная не подобрана - есть отдельное замечание
+            return None, None
+        if lib is not None and lib.has(family):
+            return "block", family
+        for key in (f"{family}/{b_art}", f"{family}/{card['ригель']['артикул']}"):
+            pts = shapes.get(key, {}).get("точки")
+            if pts:
+                return "poly", pts
+        no_shape.add(f"{family} (ригель {b_art})")
+        return None, None
+
+    for y, xl, xr, code, b_art in fac.beam_spans:
         layer = INSERT_LAYER_PREFIX + _layer_safe(code)
+        kind, data = insert_form(code, b_art)
         for x_face, d in ((xl + half, 1), (xr - half, -1)):
-            if shape:
-                # зеркальный конец: x -> -x, дуги меняют знак; обход в обратную сторону не нужен для замкнутой
-                pts = [(x_face + d * px, y + py, b * d) for px, py, b in shape]
+            if kind == "block":
+                items.append(Item("insert", layer, place=Place(data, x_face, y, 0.0, d < 0)))
+            elif kind == "poly":
+                pts = [(x_face + d * px, y + py, b * d) for px, py, b in data]
+                items.append(Item("poly", layer, pts=pts))
             else:
                 x1 = x_face + d * L
                 pts = _rect(min(x_face, x1), y - H, max(x_face, x1), y + H)
-            items.append(Item("poly", layer, pts=pts))
+                items.append(Item("poly", layer, pts=pts))
         items.append(Item("text", layer, x=(xl + xr) / 2, y=y - half - 45, h=f["высота_выноски"] * f["масштаб"] * 0.6,
                           text=code))
+    if no_shape:
+        fac.warnings.append("Закладные: контур не задан - " + "; ".join(sorted(no_shape)) +
+                            " - на фасаде условное изображение (прямоугольник); нарисуйте блок закладной"
+                            " в библиотеке или запишите контур в _контуры.json ключ «СЕМЕЙСТВО/артикул ригеля»")
 
     zs = card["закладная_стойки"]
     plat = card["монтаж"]["в_проем_платик"].split(" ")[0]

@@ -161,6 +161,17 @@ def library_path(system) -> Path | None:
     return Path(p) if p else None
 
 
+_LIBS: dict[str, tuple[int, "R.Library"]] = {}        # путь -> (mtime, библиотека): DXF читаем один раз
+
+
+def _library(path: Path) -> "R.Library":
+    st = Path(path).stat()
+    key = str(path)
+    if key not in _LIBS or _LIBS[key][0] != st.st_mtime_ns:
+        _LIBS[key] = (st.st_mtime_ns, R.Library(path))
+    return _LIBS[key][1]
+
+
 def load(system, systems_dir: Path) -> tuple[list[LibNode], R.Library | None]:
     """Узлы библиотеки (из кэша, если файл образцов не менялся) и сама библиотека блоков."""
     path = library_path(system)
@@ -172,7 +183,7 @@ def load(system, systems_dir: Path) -> tuple[list[LibNode], R.Library | None]:
     if cache.exists():
         d = json.loads(cache.read_text(encoding="utf-8"))
         if d.get("метка") == stamp:
-            return [_from_json(x) for x in d["узлы"]], R.Library(path)
+            return [_from_json(x) for x in d["узлы"]], _library(path)
     nodes, lib, _ = read_library(path, system)
     cache.write_text(json.dumps({"источник": str(path), "метка": stamp, "узлы": [_to_json(n) for n in nodes]},
                                 ensure_ascii=False, indent=0), encoding="utf-8")
@@ -234,9 +245,13 @@ class Source:
             cand = same
         if cand:
             n = sorted(cand, key=lambda n: not n.labeled)[0]
-            prof = self._profile(beam, n.profile_place) or n.profile_place
-            if prof.name != n.profile:
-                pass
+            prof = self._profile(beam, n.profile_place)
+            if prof is None:
+                art = (o.ригель or self.card["ригель"]["артикул"]) if beam \
+                    else (o.стойка or self.card["стойка"]["артикул"])
+                notes.append(f"{kind}: в библиотеке нет блока «{art}» - в сечении оставлен "
+                             f"{n.profile} из узла; переименуйте/дорисуйте блок и повторите сверку")
+                prof = n.profile_place
             places = [prof] + [p for _, p in n.items]
             if glass_below:
                 setting = {R.block_name(R._art(a)) for r in self.system.kits for a, _, _ in parse_items(r["Подкладка опорная"])}
@@ -280,6 +295,10 @@ def export_blocks(lib: R.Library, names: set[str], out: Path) -> dict[str, str]:
             elif e.dxftype() == "LINE":
                 h.update(repr((round(e.dxf.start.x, 3), round(e.dxf.start.y, 3), round(e.dxf.end.x, 3),
                                round(e.dxf.end.y, 3))).encode())
+            elif e.dxftype() == "ARC":
+                h.update(repr((round(e.dxf.center.x, 3), round(e.dxf.center.y, 3),
+                               round(e.dxf.radius, 3), round(e.dxf.start_angle, 2),
+                               round(e.dxf.end_angle, 2))).encode())
         sig[name] = "fasad-узел " + h.hexdigest()[:10]
         blk.block.dxf.description = sig[name]
     doc.saveas(str(out))
