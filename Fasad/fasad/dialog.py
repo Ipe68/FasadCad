@@ -406,6 +406,31 @@ def ask_stocks(rows: list[tuple[str, str, float]], lengths: dict[str, float], de
     return result
 
 
+def ask_profile(title: str, options: list[tuple[str, str]], current: str) -> str | None:
+    """Окно выбора профиля для замены по марке (команда ЗАМЕНАПРОФИЛЯ).
+    options - [(артикул, расшифровка)], current - текущий артикул.
+    Возвращает выбранный артикул или None (пропуск)."""
+    root = _root(title)
+    frm = ttk.Frame(root, padding=12)
+    frm.pack(fill="both", expand=True)
+    vals = [f"{v}{SEP}{d}" for v, d in options]
+    var = tk.StringVar(value=next((x for x in vals if norm_art(x.split(SEP)[0]) == norm_art(current)),
+                                  vals[0] if vals else ""))
+    ttk.Combobox(frm, textvariable=var, values=vals, width=86, state="readonly").pack(fill="x", pady=6)
+    result: dict = {}
+
+    def ok():
+        result["art"] = var.get().split(SEP)[0].strip()
+        root.destroy()
+
+    btns = ttk.Frame(frm)
+    btns.pack(fill="x", pady=(8, 0))
+    ttk.Button(btns, text="OK", command=ok).pack(side="right", padx=4)
+    ttk.Button(btns, text="Пропустить", command=root.destroy).pack(side="right")
+    _show(root)
+    return result.get("art")
+
+
 def report(title: str, lines: list[str], warnings: list[str]):
     """Окно "Готово": что построено и что проверить (крупно, предупреждения - красным)."""
     root = _root(title)

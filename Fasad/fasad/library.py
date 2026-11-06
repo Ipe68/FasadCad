@@ -215,23 +215,35 @@ class Source:
     def ready(self) -> bool:
         return bool(self.nodes) and self.lib is not None
 
-    def _profile(self, beam: bool, ref: Place) -> Place | None:
-        art = (self.obj.ригель or self.card["ригель"]["артикул"]) if beam else (self.obj.стойка or self.card["стойка"]["артикул"])
+    def _profile(self, beam: bool, ref: Place, art: str | None = None) -> Place | None:
+        """Профиль в узле: выбранный артикул (art) или из исходных данных."""
+        if art is None:
+            art = (self.obj.ригель or self.card["ригель"]["артикул"]) if beam \
+                else (self.obj.стойка or self.card["стойка"]["артикул"])
         if not self.lib.has(art):
             return None
         p = Place(art, 0.0, 0.0, ref.rot, ref.mirror)
         b = self.lib.placed_box(p)
         return Place(art, round(-R._cx(b), 3), round(-b[3], 3), ref.rot, ref.mirror)
 
-    def node(self, beam: bool, edge: bool, glass_below: bool = False) -> Picked:
-        """Узел в системе узла. glass_below - верхний ригель: опорная подкладка не нужна (она под стеклом)."""
+    def node(self, beam: bool, edge: bool, glass_below: bool = False, art: str | None = None,
+             variant: str | None = None) -> Picked:
+        """Узел в системе узла. glass_below - верхний ригель: опорная подкладка не нужна (она под стеклом).
+        art - профиль для сечения (по умолчанию из исходных данных).
+        variant - вариант комплектации узла (по умолчанию из исходных данных; в А-А под лёгкими
+        пакетами берётся обычный вариант по карте "подкладки_по_весу")."""
         o = self.obj
         kind = "ригель" if beam else "стойка"
+        if art is None:
+            art = (o.ригель or self.card["ригель"]["артикул"]) if beam \
+                else (o.стойка or self.card["стойка"]["артикул"])
+        if variant is None:
+            variant = o.вариант
         notes = []
         want = None
         if edge:
             want = wanted_stack(self.perimeter.get("Крайний ригель" if beam else "Крайняя стойка", ""), o.доборные)
-        cand = [n for n in self.nodes if n.variant == o.вариант and n.thick == o.заполнение and n.beam == beam
+        cand = [n for n in self.nodes if n.variant == variant and n.thick == o.заполнение and n.beam == beam
                 and n.edge == edge]
         if edge:
             same = [n for n in cand if Counter(label(a, self.known) for a in n.stack) == Counter(want)]
@@ -245,10 +257,8 @@ class Source:
             cand = same
         if cand:
             n = sorted(cand, key=lambda n: not n.labeled)[0]
-            prof = self._profile(beam, n.profile_place)
+            prof = self._profile(beam, n.profile_place, art)
             if prof is None:
-                art = (o.ригель or self.card["ригель"]["артикул"]) if beam \
-                    else (o.стойка or self.card["стойка"]["артикул"])
                 notes.append(f"{kind}: в библиотеке нет блока «{art}» - в сечении оставлен "
                              f"{n.profile} из узла; переименуйте/дорисуйте блок и повторите сверку")
                 prof = n.profile_place
@@ -263,7 +273,6 @@ class Source:
                      f"собран по правилам, ПРОВЕРИТЬ")
         if not self.rules:
             raise ValueError("нет ни узла в библиотеке, ни привязок (py Привязки.py)")
-        art = (o.ригель or self.card["ригель"]["артикул"]) if beam else (o.стойка or self.card["стойка"]["артикул"])
         b = R.build_node(self.rules, self.lib, beam=beam, thick=o.заполнение, profile=art, kit=self.kit, card=self.card,
                          edge_stack=want if edge else None)
         places = b.places

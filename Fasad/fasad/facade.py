@@ -97,6 +97,7 @@ class Glass:
     y1: float
     weight: float = 0.0      # кг
     mark: str = ""           # марка (сквозная по чертежу), например Ст50_03
+    pads: str = ""           # комплект опорных подкладок (по весу: тяжёлые/лёгкие)
 
     @property
     def width(self) -> float:
@@ -348,6 +349,13 @@ def _has_heavy_kit(system, thick) -> bool:
         if rt == t and str(r["Вариант"]).startswith("Тяжелые"):
             return True
     return False
+
+
+def _pad_heavy(wt: float, card) -> bool:
+    """Тяжёлые опорные подкладки нужны, если вес стекла попал в "тяжелый" способ крепления ригеля."""
+    rules = sorted(card["крепление_ригеля"], key=lambda r: r["до_кг"])
+    rule = next((r for r in rules if wt <= r["до_кг"]), None)
+    return True if rule is None else bool(rule.get("тяжелый"))
 
 
 def _split_axes(axes: list[Axis]):
@@ -713,6 +721,18 @@ def _build(axes: list[Axis], system: System, obj: ObjectParams,
                 need = "КПС 846 (40-48 мм)" if obj.заполнение <= 48 else "КПС 1126 (52-58 мм)"
                 fac.warnings.append(f"Ригель {where}: стекло {wt:g} кг - нужны подкладки {need}, "
                                     f"а выбран вариант \"{kit['Вариант']}\"")
+    # опорные подкладки по весу стекла: тяжёлый комплект - только под тяжёлыми пакетами
+    light_pads = ""
+    light_variant = card.get("подкладки_по_весу", {}).get(str(kit.get("Вариант", "")))
+    if light_variant:
+        try:
+            light_pads = system.kit(obj.заполнение, light_variant).get("Подкладка опорная", "")
+        except ValueError:
+            fac.warnings.append(f"Подкладки: лёгкий вариант \"{light_variant}\" не найден для толщины "
+                                f"{obj.заполнение} мм - под всеми стёклами тяжёлые")
+    heavy_pads = kit.get("Подкладка опорная", "")
+    for gl in fac.glasses:
+        gl.pads = (heavy_pads if _pad_heavy(gl.weight, card) else light_pads) or heavy_pads
     for y, xl, xr, f_art in fac.false_spans:           # фальш-ригель стекло не несёт - под винты
         ins = system.insert(f_art, "с")
         name = f'{ins["Шифр"]} (L={ins["L, мм"]}, стр. {ins["Стр."]})' if ins else f"закладная для {f_art} (УТОЧНИТЬ)"

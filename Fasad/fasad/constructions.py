@@ -187,6 +187,31 @@ def parse_profile_tables(lines: list[str]) -> dict[str, dict[str, tuple[str, tup
     return out
 
 
+def set_profile_code(edits: list[tuple[str, str, str]]) -> str:
+    """LISP: в таблицах профилей заменить артикул у строк заданных марок.
+    edits - [(витраж, марка, новый артикул)]. Результат: "правок N"."""
+    def s(t):
+        return '"' + t.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+    cases = " ".join(
+        f'((and (= марка {s(mark)}) (= витраж {s(vitrage)})) '
+        f'(progn (entmod (subst (cons 1 {s(art)}) (assoc 1 cell) cell)) (setq n (1+ n))))'
+        for vitrage, mark, art in edits)
+    return (f'(progn (setq n 0) '
+            f'(if (setq ss (ssget "_X" (list (cons 0 "INSERT") (cons 8 {_s(TABLE_LAYER)}) (cons 2 {_s(ROW_BLOCK)})))) '
+            f'(progn (setq i 0) '
+            f'(while (< i (sslength ss)) '
+            f'(setq en (ssname ss i) sub (entnext en) марка nil витраж nil cell nil) '
+            f'(while (and sub (= "ATTRIB" (cdr (assoc 0 (setq ae (entget sub)))))) '
+            f'(cond ((= "МАРКА" (cdr (assoc 2 ae))) (setq марка (cdr (assoc 1 ae)))) '
+            f'((= "ВИТРАЖ" (cdr (assoc 2 ae))) (setq витраж (cdr (assoc 1 ae)))) '
+            f'((= "АРТИКУЛ" (cdr (assoc 2 ae))) (setq cell ae))) '
+            f'(setq sub (entnext sub))) '
+            f'(if (and марка витраж cell) (cond {cases} (t nil))) '
+            f'(setq i (1+ i))))) '
+            f'(strcat "правок " (itoa n)))')
+
+
 def clear_tables_code() -> str:
     """LISP: стереть таблицы профилей (свой слой программы)."""
     return (f'(progn (if (setq ss (ssget "X" (list (cons 8 {_s(TABLE_LAYER)}) (cons 410 "Model")))) '

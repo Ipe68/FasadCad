@@ -167,9 +167,16 @@ def build_spec(fac: Facade, system: System, obj: ObjectParams, title: str = "В�
             mass = round(ins_mass[m.group(1)] * _num(m.group(2)) / ins_len[m.group(1)], 3)
         add_piece(art, kind, n or None, mass, "" if n else "количество уточнить")
     n_gl = len(fac.glasses)
-    for col, name in (("Подкладка опорная", "Подкладка опорная"), ("Подкладка фиксир.", "Подкладка фиксирующая")):
-        for art, q in _kit_items(kit.get(col, "")):
-            add_piece(art, f"{name}, 2 компл. на стекло", q * 2 * n_gl, None, f"комплект: {kit[col]} (стр. 47)")
+    # опорные - комплектом каждого стекла (по весу: тяжёлые только под тяжёлыми пакетами)
+    from collections import Counter
+    for pad_set, n_gs in sorted(Counter(g.pads for g in fac.glasses if g.pads).items()):
+        page = next((r["Стр."] for r in system.kits if r.get("Подкладка опорная") == pad_set), "47")
+        for art, q in _kit_items(pad_set):
+            add_piece(art, "Подкладка опорная, 2 компл. на стекло", q * 2 * n_gs, None,
+                      f"комплект: {pad_set} (стр. {page})")
+    for art, q in _kit_items(kit.get("Подкладка фиксир.", "")):
+        add_piece(art, "Подкладка фиксирующая, 2 компл. на стекло", q * 2 * n_gl, None,
+                  f"комплект: {kit['Подкладка фиксир.']} (стр. 47)")
     vc = card["винты_прижима"]
     clamps = [p for p in fac.parts if p.kind == "Прижим"]
     if kit.get("Винт прижима"):

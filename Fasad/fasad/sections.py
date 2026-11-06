@@ -16,7 +16,7 @@ from pathlib import Path
 
 from .catalog_nodes import block_name, load_base, load_perimeter, node_template
 from .catalog_pads import LIP_FROM_NOSE, RUBBER, bearing_y
-from .facade import TOL, Facade, ObjectParams, System, formula_layers, parse_items, pick_filler
+from .facade import TOL, Facade, ObjectParams, System, _pad_heavy, formula_layers, parse_items, pick_filler
 from .nodes import Place, node_places
 from .profiles import block_polylines
 
@@ -240,10 +240,22 @@ def _sections_library(fac: Facade, system: System, obj: ObjectParams, folder: Pa
     y0 = floor - sc["отступ_сечения"] - 2 * hb
     left, right = fac.post_x[0], fac.post_x[-1]
     leader_bb = []
-    mid = src.node(beam=False, edge=False)
+
+    def post_art(px) -> str:
+        """Профиль стойки для сечения: по детали марки (с учётом правок таблицы профилей)."""
+        n = fac.post_x.index(px) + 1
+        p = next((p for p in fac.parts if p.where == f"S{n}" and p.kind == "Стойка"), None)
+        return p.article if p else (obj.стойка or card["стойка"]["артикул"])
+
+    node_cache: dict = {}
+    mid = None
     for px in fac.post_x:
         edge = px in (left, right)
-        node = src.node(beam=False, edge=True) if edge else mid
+        key = (edge, post_art(px))
+        if key not in node_cache:
+            node_cache[key] = src.node(beam=False, edge=edge, art=key[1])
+        node = node_cache[key]
+        mid = mid or node
         vdir = (-1, 0) if edge and px == right else (1, 0)          # сторона стекла крайнего - внутрь витража
         anchors = put(node, R._frame((px, y0), (0, -1), vdir))
         if px == left:
@@ -281,14 +293,51 @@ def _sections_library(fac: Facade, system: System, obj: ObjectParams, folder: Pa
         nose_x = x0 - rn
         ys = sorted(fac.bays.get(bay, []))
         groups: dict[float, tuple] = {}
+
+        def b_art(y) -> str:
+            """Профиль ригеля пролёта: по марке (с учётом правок таблицы профилей)."""
+            return fac.beam_art.get((round(y, 3), bay[0], bay[1])) or obj.ригель \
+                   or card["ригель"]["артикул"]
+
+        # вес стекла на ригеле -> вариант узла: тяжёлый вариант только под тяжёлыми пакетами,
+        # под лёгкими и без пакета - обычный (карта "подкладки_по_весу" в карточке)
+        fix_wt = {}
+        for where, wt, *_ in fac.fixings:
+            try:
+                y_s, posts = where.split()
+                ia, ib = (int(p[1:]) for p in posts.split("-"))
+                fix_wt[(round(float(y_s[1:])), ia, ib)] = wt
+            except (ValueError, IndexError):
+                continue
+        light_variant = card.get("подкладки_по_весу", {}).get(obj.вариант)
+
+        def b_variant(y):
+            if not light_variant:
+                return None
+            try:
+                ia, ib = fac.post_x.index(bay[0]) + 1, fac.post_x.index(bay[1]) + 1
+                wt = fix_wt.get((round(y), ia, ib), 0.0)
+            except ValueError:
+                wt = 0.0
+            return None if _pad_heavy(wt, card) else light_variant
+
+        bnode_cache: dict = {}
         mid_b = None
         for y in ys:
             if abs(y - fac.bottom_y) < TOL:
-                key, node, vdir = "ригель_край", src.node(beam=True, edge=True), (0, 1)
+                key, vdir = "ригель_край", (0, 1)
+                gb = (True, False)
             elif abs(y - fac.top_y) < TOL:
-                key, node, vdir = "ригель_край", src.node(beam=True, edge=True, glass_below=True), (0, -1)
+                key, vdir = "ригель_край", (0, -1)
+                gb = (True, True)
             else:
-                key, node, vdir = "ригель_середина", src.node(beam=True, edge=False), (0, 1)
+                key, vdir = "ригель_середина", (0, 1)
+                gb = (False, False)
+            ck = (key, gb[1], b_art(y), b_variant(y))
+            if ck not in bnode_cache:
+                bnode_cache[ck] = src.node(beam=True, edge=gb[0], glass_below=gb[1], art=ck[2],
+                                           variant=ck[3])
+            node = bnode_cache[ck]
             mid_b = mid_b or node
             anchors = put(node, R._frame((nose_x, y), (1, 0), vdir))
             if y == ys[0] or (len(ys) > 2 and y == ys[1]):
