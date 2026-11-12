@@ -177,6 +177,9 @@ class LoraApp(QtWidgets.QMainWindow):
         self.pushButton_6.clicked.connect(self.calculate)
         self.pushButton_7.clicked.connect(self.show_settings)
         self.pushButton_10.clicked.connect(self.show_schema)
+        # Экспорт отчёта в PDF
+        if hasattr(self, 'pushButton_9'):
+            self.pushButton_9.clicked.connect(self.export_report)
         # Пересчет при смене профиля вручную
         self.comboBox_9.currentIndexChanged.connect(self.recalculate_verification)
         self.comboBox_10.currentIndexChanged.connect(self.recalculate_verification)
@@ -472,11 +475,13 @@ class LoraApp(QtWidgets.QMainWindow):
             f2 = data['b1']
             
             # E36 (Нормативная): (qG*cos(a) + s0*cos2(a)/1.6 + w_norm) * F2
+            # k1, k2 на нагрузки НЕ умножаются (как в СТАТИКЕ): они увеличивают только требуемый Ix стойки
             k1 = k1k2['k1']
             k2 = k1k2['k2']
-            q_mullion_norm = (qG_norm * cos_alpha + (s0_norm * cos_alpha2 / 1.6) + w_norm) * f2 / 1000.0 * k1
+            k_edge = (k1 * k2) if self.settings.get('use_alutech', True) else 1.0   # I36 = G36*H36
+            q_mullion_norm = (qG_norm * cos_alpha + (s0_norm * cos_alpha2 / 1.6) + w_norm) * f2 / 1000.0
             # E35 (Расчетная): (qG*cos(a)*K10 + s0*cos2(a) + w_norm*gamma_f) * F2
-            q_mullion_calc = (qG_norm * cos_alpha * k_safety_glass + (s0_norm * cos_alpha2) + (w_norm * gamma_f_wind)) * f2 / 1000.0 * k1
+            q_mullion_calc = (qG_norm * cos_alpha * k_safety_glass + (s0_norm * cos_alpha2) + (w_norm * gamma_f_wind)) * f2 / 1000.0
             
             self.lineEdit_33.setText(f"{q_mullion_norm:.3f}")
             self.lineEdit_30.setText(f"{q_mullion_calc:.3f}")
@@ -490,9 +495,9 @@ class LoraApp(QtWidgets.QMainWindow):
             f6 = (f3 / 2.0 if f3 < f4 else f4 / 2.0) + (f3 / 2.0 if f3 < f5 else f5 / 2.0)
             
             # E48 (Нормативная)
-            q_transom_norm = (qG_norm * cos_alpha + (s0_norm * cos_alpha2 / 1.6) + w_norm) * f6 / 1000.0 * k2
+            q_transom_norm = (qG_norm * cos_alpha + (s0_norm * cos_alpha2 / 1.6) + w_norm) * f6 / 1000.0
             # E47 (Расчетная)
-            q_transom_calc = (qG_norm * cos_alpha * k_safety_glass + (s0_norm * cos_alpha2) + (w_norm * gamma_f_wind)) * f6 / 1000.0 * k2
+            q_transom_calc = (qG_norm * cos_alpha * k_safety_glass + (s0_norm * cos_alpha2) + (w_norm * gamma_f_wind)) * f6 / 1000.0
             
             self.lineEdit_32.setText(f"{q_transom_norm:.3f}")
             self.lineEdit_31.setText(f"{q_transom_calc:.3f}")
@@ -528,7 +533,8 @@ class LoraApp(QtWidgets.QMainWindow):
                 railing_enabled,
                 railing_norm_kn,
                 data['safety_yn'],
-                data['mullion_deflection_ratio']
+                data['mullion_deflection_ratio'],
+                k_edge
             )
             self.update_mullion_req_ui(m_req)
 
@@ -571,6 +577,16 @@ class LoraApp(QtWidgets.QMainWindow):
             # чтобы значения в lineEdit_47 не перезаписывались)
             self.handle_railing_load(data)
 
+            # Контекст проверки прочности (формулы примера отчёта, СП 128.13330.2016):
+            # стойка - сжато-изгибаемая (N/A + Mx/Wx), ригель - изгиб в двух плоскостях (Mx/Wx + My/Wy)
+            self._str_ctx = {
+                'data': data, 'q_m_calc': q_mullion_calc, 'q_t_calc': q_transom_calc, 'f6': f6,
+                'q_m_norm': q_mullion_norm,
+                'qG_norm': qG_norm, 'k_glass': k_safety_glass, 'r_calc': r_calc,
+                'is_single': is_single_span, 'railing': railing_enabled,
+                'railing_kn': railing_norm_kn,
+            }
+
             # --- ПОДБОР И ПРОВЕРКА ---
             if auto_select:
                 self.auto_select_profiles(m_req, t_req)
@@ -583,6 +599,34 @@ class LoraApp(QtWidgets.QMainWindow):
                 manual_transom = self.manual_profile_data['transom']
 
             self.verify_selected_profiles(q_mullion_norm, q_transom_norm, p_glass_norm, data, m_req, t_req, t_req['f_allow_wind'], f_allow_transom_weight, manual_mullion, manual_transom)
+
+            # Прочность выбранных профилей (для окна и отчёта)
+            strength_m = strength_t = None
+            pm = self._report_profile(self.comboBox_9, 'стойка')
+            pt = self._report_profile(self.comboBox_10, 'ригель')
+            if pm:
+                strength_m = self._mullion_check(pm)
+                if not strength_m['ok']:
+                    self.lineEdit_37.setStyleSheet("color: red;")
+            if pt:
+                strength_t = self._transom_check(pt)
+                if not strength_t['ok']:
+                    self.lineEdit_45.setStyleSheet("color: red;")
+
+            # Данные для отчёта PDF (кнопка \"Экспорт *.pdf\")
+            self._report_ctx = {
+                'strength_m': strength_m, 'strength_t': strength_t,
+                'data': data, 'wind': wind, 'snow': snow, 'k1k2': k1k2,
+                'use_k': self.settings.get('use_alutech', True),
+                'qG_norm': qG_norm, 'gamma_f_wind': gamma_f_wind,
+                'k_glass': k_safety_glass, 'gamma_snow': 1.6,
+                'q_m_norm': q_mullion_norm, 'q_m_calc': q_mullion_calc,
+                'q_t_norm': q_transom_norm, 'q_t_calc': q_transom_calc,
+                'f6': f6, 'weight_kg': weight_kg, 'r_calc': r_calc,
+                'is_single': is_single_span, 'railing': railing_enabled,
+                'm_req': m_req, 't_req': t_req,
+                'f_allow_weight': f_allow_transom_weight,
+            }
 
             # Запоминаем результат для передачи в программу Фасад
             self._calculated_once = True
@@ -646,16 +690,24 @@ class LoraApp(QtWidgets.QMainWindow):
         return os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             'save_data', 'последний_сеанс.json')
 
+    def _own_widgets(self, cls):
+        """Виджеты самого главного окна. Дочерние диалоги (например, ручной ввод профиля)
+        исключаются: у них те же objectName (lineEdit, lineEdit_8 ...), и их значения
+        перезаписывали поля главного окна в файле сеанса."""
+        return [w for w in self.findChildren(cls) if w.objectName() and w.window() is self]
+
+    # Поля, которые читаются как числа: некорректный текст из файла сеанса игнорируется
+    _NUMERIC_FIELDS = {'lineEdit', 'lineEdit_2', 'lineEdit_3', 'lineEdit_4', 'lineEdit_5', 'lineEdit_6',
+                       'lineEdit_7', 'lineEdit_8', 'lineEdit_9', 'lineEdit_10', 'lineEdit_11', 'lineEdit_12'}
+
     def _save_session(self):
         """Запомнить введённые данные (все поля ввода/списки) для следующего запуска."""
         import json
         data = {'line': {}, 'combo': {}}
-        for w in self.findChildren(QtWidgets.QLineEdit):
-            if w.objectName():
-                data['line'][w.objectName()] = w.text()
-        for w in self.findChildren(QtWidgets.QComboBox):
-            if w.objectName():
-                data['combo'][w.objectName()] = w.currentIndex()
+        for w in self._own_widgets(QtWidgets.QLineEdit):
+            data['line'][w.objectName()] = w.text()
+        for w in self._own_widgets(QtWidgets.QComboBox):
+            data['combo'][w.objectName()] = w.currentIndex()
         try:
             os.makedirs(os.path.dirname(self._session_file()), exist_ok=True)
             with open(self._session_file(), 'w', encoding='utf-8') as f:
@@ -673,12 +725,20 @@ class LoraApp(QtWidgets.QMainWindow):
             return
         self._restoring = True
         try:
+            lines = {w.objectName(): w for w in self._own_widgets(QtWidgets.QLineEdit)}
+            combos = {w.objectName(): w for w in self._own_widgets(QtWidgets.QComboBox)}
             for name, text in data.get('line', {}).items():
-                w = self.findChild(QtWidgets.QLineEdit, name)
-                if w is not None:
-                    w.setText(text)
+                w = lines.get(name)
+                if w is None:
+                    continue
+                if name in self._NUMERIC_FIELDS:
+                    try:
+                        float(str(text).replace(',', '.') or 0)
+                    except ValueError:
+                        continue        # испорченное значение (например, артикул) - оставляем текущее
+                w.setText(text)
             for name, idx in data.get('combo', {}).items():
-                w = self.findChild(QtWidgets.QComboBox, name)
+                w = combos.get(name)
                 if w is not None and isinstance(idx, int) and 0 <= idx < w.count():
                     w.setCurrentIndex(idx)
         finally:
@@ -706,6 +766,12 @@ class LoraApp(QtWidgets.QMainWindow):
             try:
                 self.lineEdit_12.setText(f"{float(t):g}")
             except (ValueError, TypeError):
+                pass
+        angle = self._fasad_input.get('угол')
+        if angle is not None:
+            try:
+                self.lineEdit_9.setText(f"{float(angle):g}")
+            except (ValueError, TypeError, AttributeError):
                 pass
         dims = self._fasad_input.get('размеры') or {}
         for key, field in (('b1', 'lineEdit_4'), ('b2', 'lineEdit_5'), ('l1', 'lineEdit_6'),
@@ -750,10 +816,12 @@ class LoraApp(QtWidgets.QMainWindow):
         rg = self._current_profile(self.comboBox_10, 'ригель')
         if st and 'ix' in st:
             st['ok'] = bool(lc) and st['ix'] >= lc.get('стойка_треб_ix_см4', 0) \
-                and st.get('wx', 0) >= lc.get('стойка_треб_wx_см3', 0)
+                and st.get('wx', 0) >= lc.get('стойка_треб_wx_см3', 0) \
+                and ((getattr(self, '_report_ctx', None) or {}).get('strength_m') or {}).get('ok', True)
         if rg and 'ix' in rg:
             rg['ok'] = bool(lc) and rg['ix'] >= lc.get('ригель_треб_ix_см4', 0) \
-                and rg.get('iy', 0) >= lc.get('ригель_треб_iy_см4', 0)
+                and rg.get('iy', 0) >= lc.get('ригель_треб_iy_см4', 0) \
+                and ((getattr(self, '_report_ctx', None) or {}).get('strength_t') or {}).get('ok', True)
         result = {
             'программа': 'Lora 2.2',
             'дата': datetime.now().isoformat(timespec='seconds'),
@@ -775,6 +843,151 @@ class LoraApp(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(self, 'Экспорт в FS',
                                               'Результат передан в Фасад.')
             self.close()
+
+    # ---------- проверка прочности (как в примере отчёта) ----------
+
+    def _mullion_check(self, p):
+        c = self._str_ctx
+        d = c['data']
+        return calculations.mullion_strength(
+            p, c['q_m_calc'], d['h_m'], d['b1'], c['r_calc'], d['safety_yn'], d['angle_deg'],
+            c['qG_norm'], c['k_glass'], c['is_single'], c['railing'], c['railing_kn'])
+
+    def _transom_check(self, p):
+        c = self._str_ctx
+        d = c['data']
+        return calculations.transom_strength(
+            p, c['q_t_calc'], c['f6'], d['b2'], d['l1'], d['l2'], d['angle_deg'],
+            c['qG_norm'], c['k_glass'], d['a_pad'], c['r_calc'], d['safety_yn'],
+            c['is_single'], c['railing'])
+
+    def _mullion_edge(self, p):
+        """Прогиб стойки и прогиб кромки стеклопакета для профиля p (как в СТАТИКЕ: I39, G45, E44)."""
+        c = self._str_ctx
+        d = c['data']
+        return calculations.mullion_edge_deflection(
+            p['ix'], d['h_m'], c['q_m_norm'], c['is_single'], c['railing'], d['b1'],
+            max(d['l1'], d['l2']), c['railing_kn'])
+
+    def _mullion_ok(self, p, m_req):
+        """Стойка подходит: Ix >= Ix,тр, прочность (N/A + Mx/Wx) / (Ryn*gamma_c) <= 1
+        и прогиб кромки стеклопакета < 8 мм."""
+        return (p['ix'] >= m_req['ix_req'] and self._mullion_check(p)['ok']
+                and self._mullion_edge(p)['ok'])
+
+    def _transom_ok(self, p, t_req):
+        """Ригель подходит: Ix, Iy и прочность (Mx/Wx + My/Wy) / (Ryn*gamma_c) <= 1."""
+        return (p['ix'] >= t_req['ix_req'] and p['iy'] >= t_req['iy_req']
+                and self._transom_check(p)['ok'])
+
+    # ---------- отчёт PDF ----------
+
+    def _report_profile(self, combo, kind):
+        """Полные характеристики выбранного профиля (стойка/ригель) для отчёта."""
+        if self.comboBox_11.currentText() == "Ручной ввод" and getattr(self, 'manual_profile_data', None):
+            p = self.manual_profile_data['mullion' if kind == 'стойка' else 'transom']
+            return self._manual_report_profile(p, kind)
+        if combo.count() == 0 or combo.currentIndex() < 0:
+            return None
+        art = combo.itemData(combo.currentIndex())
+        if art is None:
+            text = combo.currentText()
+            art = text.split('|')[0] if '|' in text else text
+        norm = str(art).replace(' ', '').strip()
+        system = self.comboBox_11.currentText()
+        rows = (self.data_handler.get_mullions(system) if kind == 'стойка'
+                else self.data_handler.get_transoms(system))
+        for p in rows:
+            if str(p['art']).replace(' ', '').strip() == norm:
+                return {k: p.get(k) for k in ('art', 'depth', 'ix', 'iy', 'wx', 'wy', 'area', 'mass')}
+        return None
+
+    def _catalog_mass(self, art):
+        """Масса погонного метра профиля из таблицы profiles.xlsx по артикулу (во всех системах)."""
+        norm = str(art).replace(' ', '').strip().lower()
+        if not norm:
+            return None
+        for system in self.data_handler.system_names:
+            for p in self.data_handler.get_mullions(system) + self.data_handler.get_transoms(system):
+                if str(p['art']).replace(' ', '').strip().lower() == norm and p.get('mass'):
+                    return p['mass']
+        return None
+
+    def _manual_report_profile(self, p, kind):
+        """Профиль ручного ввода для отчёта: итоговые характеристики + раздельно профиль и усилитель
+        + шаги расчёта составного сечения (calculations.composite_section)."""
+        is_m = (kind == 'стойка')
+        out = {
+            'art': p.get('art', ''), 'depth': p.get('depth', 0),
+            'ix': p.get('ix_tot', p.get('ix', 0)), 'iy': p.get('iy_tot', p.get('iy', 0)),
+            'wx': p.get('wx_tot', p.get('wx', 0)), 'wy': p.get('wy_tot', p.get('wy', 0)),
+            'area': p.get('area_tot', p.get('area', 0)),
+        }
+        base = {'ix': p.get('ix', 0), 'iy': p.get('iy', 0), 'wx': p.get('wx', 0), 'wy': p.get('wy', 0),
+                'area': p.get('area', 0), 'depth': p.get('depth', 0), 'width': p.get('width', 0)}
+        m_cat = self._catalog_mass(p.get('art', ''))
+        base['mass'] = m_cat if m_cat else calculations.mass_per_m(base['area'], 'алюминий')
+        base['mass_src'] = 'таблица профилей' if m_cat else 'расчёт по площади сечения (ρ = 2700 кг/м³)'
+        out['mass'] = base['mass']
+        amp = p.get('rein_eff') or {'mode': 'none'}
+        if p.get('rein_active') and amp.get('mode') in ('char', 'geom'):
+            ay_main = p.get('ay_main' if is_m else 'ay_main_t', 0.0)
+            ay_rein = p.get('ay_rein' if is_m else 'ay_rein_t', 0.0)
+            mat = p.get('rein_material', 'алюминий')
+            comp = calculations.composite_section(
+                base['ix'], base['iy'], base['area'], base['depth'], base['width'], ay_main, p.get('ax_main', 0.0),
+                amp.get('ix', 0.0), amp.get('iy', 0.0), amp.get('area', 0.0), amp.get('bx', 0.0), amp.get('by', 0.0),
+                ay_rein, p.get('ax_rein', 0.0), mat, p.get('rein_pos', ''),
+                thermal=(p.get('sys_type') == 2), dist_user=p.get('ayay', 0.0))
+            if amp['mode'] == 'geom':
+                desc = f"{str(amp.get('shape', '')).lower()} {amp.get('bx', 0):g}×{amp.get('by', 0):g}×{amp.get('t', 0):g}"
+            else:
+                desc = p.get('rein_art') or 'усилитель'
+            amp_mass = calculations.mass_per_m(amp.get('area', 0.0), mat)
+            out['amp'] = dict(amp, desc=desc, material=mat, pos=p.get('rein_pos', ''), mass=amp_mass,
+                              ay_main=ay_main, ay_rein=ay_rein, ax_main=p.get('ax_main', 0.0),
+                              ax_rein=p.get('ax_rein', 0.0), dist_user=p.get('ayay', 0.0),
+                              thermal=(p.get('sys_type') == 2))
+            out['base'] = base
+            out['comp'] = comp
+            out['art'] = f"{p.get('art', '')} + {desc}"
+            out['mass'] = base['mass'] + amp_mass
+        return out
+
+    def export_report(self, checked=False):
+        """Кнопка \"Экспорт *.pdf\": подробный отчёт по текущему расчёту."""
+        try:
+            import Report
+        except ImportError as e:
+            QtWidgets.QMessageBox.critical(
+                self, "Экспорт PDF",
+                f"Не удалось подключить модуль отчёта:\n{e}\n\nУстановите библиотеку: pip install reportlab")
+            return
+        try:
+            self._report_ctx = {}
+            self.calculate(auto_select=False)            # отчёт строго по текущим данным окна
+            ctx = dict(getattr(self, '_report_ctx', None) or {})
+            if not ctx:
+                QtWidgets.QMessageBox.warning(self, "Экспорт PDF", "Сначала выполните расчёт.")
+                return
+            m = self._report_profile(self.comboBox_9, 'стойка')
+            t = self._report_profile(self.comboBox_10, 'ригель')
+            if not m or not t:
+                QtWidgets.QMessageBox.warning(self, "Экспорт PDF", "Не выбраны профили стойки и ригеля.")
+                return
+            title = self._fasad_input.get('название') if getattr(self, '_fasad_input', None) else ''
+            ctx.update({
+                'mullion': m, 'transom': t,
+                'system': self.comboBox_11.currentText(),
+                'address': self.settings.get('address', '').strip(),
+                'object_name': title or self.settings.get('address', '').strip(),
+                'program_version': '2.2',
+                'schema_path': resource_path("images", "Shema.png"),
+            })
+            data = Report.build_lora_report(ctx)
+            Report.export_pdf_dialog(self, data, f"Отчёт_{ctx['system']}.pdf".replace(' ', '_'))
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Экспорт PDF", f"Ошибка формирования отчёта:\n{e}")
 
     def closeEvent(self, event):
         """Перед закрытием запоминаем сеанс; для Фасада отдаём результат, если был расчёт."""
@@ -935,9 +1148,9 @@ class LoraApp(QtWidgets.QMainWindow):
         m_simple = [m for m in mullions if "+" not in m['art']]
         m_reinforced = [m for m in mullions if "+" in m['art']]
         
-        selected_m = next((m for m in m_simple if m['ix'] >= m_req['ix_req'] and m['wx'] >= m_req['wx_req']), None)
+        selected_m = next((m for m in m_simple if self._mullion_ok(m, m_req)), None)
         if not selected_m:
-            selected_m = next((m for m in m_reinforced if m['ix'] >= m_req['ix_req'] and m['wx'] >= m_req['wx_req']), None)
+            selected_m = next((m for m in m_reinforced if self._mullion_ok(m, m_req)), None)
 
         # Если подходящей стойки нет, выбираем самую "сильную", чтобы не оставаться на первом (12 мм) элементе.
         if not selected_m and mullions:
@@ -954,7 +1167,7 @@ class LoraApp(QtWidgets.QMainWindow):
         selected_m = force_combo_selection(
             self.comboBox_9,
             mullions,
-            lambda p: p['ix'] >= m_req['ix_req'] and p['wx'] >= m_req['wx_req'],
+            lambda p: self._mullion_ok(p, m_req),
             lambda p: (p['ix'], p['wx'], p['depth'])
         )
 
@@ -963,9 +1176,9 @@ class LoraApp(QtWidgets.QMainWindow):
         t_simple = [t for t in transoms if "+" not in t['art']]
         t_reinforced = [t for t in transoms if "+" in t['art']]
         
-        selected_t = next((t for t in t_simple if t['ix'] >= t_req['ix_req'] and t['iy'] >= t_req['iy_req']), None)
+        selected_t = next((t for t in t_simple if self._transom_ok(t, t_req)), None)
         if not selected_t:
-            selected_t = next((t for t in t_reinforced if t['ix'] >= t_req['ix_req'] and t['iy'] >= t_req['iy_req']), None)
+            selected_t = next((t for t in t_reinforced if self._transom_ok(t, t_req)), None)
 
         # Если подходящего ригеля нет, выбираем самый "сильный".
         if not selected_t and transoms:
@@ -982,7 +1195,7 @@ class LoraApp(QtWidgets.QMainWindow):
         selected_t = force_combo_selection(
             self.comboBox_10,
             transoms,
-            lambda p: p['ix'] >= t_req['ix_req'] and p['iy'] >= t_req['iy_req'],
+            lambda p: self._transom_ok(p, t_req),
             lambda p: (p['ix'], p['iy'], p['depth'])
         )
         
@@ -1106,7 +1319,7 @@ class LoraApp(QtWidgets.QMainWindow):
             if edge_term >= 0 and f_arc > 0:
                 f_edge = round(f_arc - 0.5 * (edge_term ** 0.5), 1)
                 self.lineEdit_40.setText(f"{f_edge:.1f}")
-                if f_edge > 8.0:
+                if f_edge >= 8.0:
                     self.label_71.setText(">8")
                     self.lineEdit_40.setStyleSheet("color: red; font-weight: bold;")
                     self.label_71.setStyleSheet("color: red;")

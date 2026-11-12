@@ -1,13 +1,14 @@
-"""Замена профиля по маркам - команда AutoCAD ЗАМЕНАПРОФИЛЯ (REPLACEPROFILE).
+"""Замена профиля по маркам - команды AutoCAD ЗАМЕНАСТОЙКИ (REPLACEPOST) и ЗАМЕНАРИГЕЛЯ (REPLACEBEAM).
 
-Читает выбранные полилинии профилей из C:/temp/fasad_replace.txt (строки "слой;minx;miny;maxx;maxy"),
-по положению определяет марки (стойки S{n} / ригели R{k}[_в/_н]), для каждой по очереди показывает
-допустимые профиля (жёсткий фильтр: тип, блок в библиотеке, закладная под вес стекла марки,
-требуемые моменты - Лора считает в фоне по геометрии марки, сеанс из её последнего сеанса),
-вписывает правку в таблицу профилей и перестраивает чертёж.
+Команда собирает выбранные полилинии профилей (подсвечивая их), первая строка файла выбора -
+"kind:стойка"/"kind:ригель". Для всех выбранных марок считается ОДИН список допустимых профилей
+по самой нагруженной: тип, блок в библиотеке, моменты по фоновому расчёту Лоры, для ригеля -
+закладная под вес и глубина не больше примыкающей стойки, для стойки - глубина не меньше
+примыкающих ригелей. Правка пишется в таблицу профилей, чертёж перестраивается.
 """
 
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -15,9 +16,9 @@ from dataclasses import replace
 from pathlib import Path
 
 from fasad.acad_link import Acad, AcadError
-from fasad.constructions import (assign_blocks, bbox, define_block_code, params_from_attrs,
-                                 parse_blocks, parse_profile_tables, read_blocks_code, set_profile_code,
-                                 split_axes)
+from fasad.constructions import (add_profile_row_code, assign_blocks, bbox, define_block_code, params_from_attrs,
+                                 parse_blocks, parse_profile_spans, parse_profile_tables, read_blocks_code,
+                                 set_profile_code, spans_code, split_axes)
 from fasad.dialog import ask_profile, report
 from fasad.facade import ObjectParams, build, load_system
 from fasad.library import load
@@ -32,21 +33,26 @@ TOL = 60.0          # допуск попадания выбора в ось/п�
 PROJECTS = Path(r"C:\cad\Projects")
 
 
-def read_selection() -> list[tuple[str, float, float, float, float]]:
-    out = []
+def read_selection() -> tuple[str, list[tuple[str, float, float, float, float]]]:
+    """Первая строка - "kind:стойка"/"kind:ригель", далее строки "слой;minx;miny;maxx;maxy"."""
+    kind, out = "стойка", []
     if SEL.exists():
-        for ln in SEL.read_text(encoding="cp1251").splitlines():
+        lines = SEL.read_text(encoding="cp1251").splitlines()
+        if lines and lines[0].startswith("kind:"):
+            kind = lines[0].split(":", 1)[1].strip() or kind
+            lines = lines[1:]
+        for ln in lines:
             f = ln.split(";")
             if len(f) == 5:
                 try:
                     out.append((f[0], *[float(v) for v in f[1:]]))
                 except ValueError:
                     pass
-    return out
+    return kind, out
 
 
 def weight_map(fac) -> dict:
-    """(округлённый y, номер стойки слева, номер справа) -> вес стекла на ригеле."""
+    """(округлённый y, номер стойки слева, справа) -> вес стекла на ригеле."""
     out = {}
     for where, wt, *_ in fac.fixings:
         try:
@@ -66,37 +72,6 @@ def span_weight(fac, y: float, xl: float, xr: float) -> float:
     return weight_map(fac).get((round(y), ia, ib), 0.0)
 
 
-def locate(sel, facs) -> list[tuple[str, str, str, object, tuple | None]]:
-    """Выбранные полилинии -> [(имя витража, марка, вид, fac, span|None)] без повторов."""
-    picks, seen = [], set()
-    for _layer, x0, y0, x1, y1 in sel:
-        xc, yc = (x0 + x1) / 2, (y0 + y1) / 2
-        vertical = abs(x1 - x0) <= abs(y1 - y0)
-        for _g, obj, fac, _owner in facs:
-            gx0, gy0, gx1, gy1 = bbox(_g)
-            if not (gx0 - TOL <= xc <= gx1 + TOL and gy0 - TOL <= yc <= gy1 + TOL):
-                continue
-            if vertical:                                    # стойка
-                px = min(fac.post_x, key=lambda p: abs(p - xc))
-                if abs(px - xc) < TOL:
-                    mark = f"S{fac.post_x.index(px) + 1}"
-                    key = (obj.имя, mark)
-                    if key not in seen:
-                        seen.add(key)
-                        picks.append((obj.имя, mark, "стойка", fac, None))
-            else:                                           # ригель - самый длинный подходящий пролёт
-                spans = [(y, xl, xr, mk) for y, xl, xr, mk in (fac.marks or [])
-                         if mk.startswith("R") and abs(y - yc) < TOL and xl - 1 <= xc <= xr + 1]
-                if spans:
-                    y, xl, xr, mk = max(spans, key=lambda s: s[2] - s[1])
-                    key = (obj.имя, mk)
-                    if key not in seen:
-                        seen.add(key)
-                        picks.append((obj.имя, mk, "ригель", fac, (y, xl, xr)))
-            break
-    return picks
-
-
 def spans_of_mark(fac, mark: str) -> list[tuple]:
     """Все пролёты марки ригеля: [(y, xl, xr)]."""
     return [(y, xl, xr) for y, xl, xr, mk in (fac.marks or []) if mk == mark]
@@ -107,6 +82,17 @@ def mark_weight(fac, mark: str, spans) -> float:
     if mark.startswith("S"):
         return 0.0
     return max((span_weight(fac, *s) for s in spans), default=0.0)
+
+
+def post_art(fac, n: int) -> str:
+    """Текущий артикул стойки S{n} (с учётом правок таблицы профилей)."""
+    p = next((p for p in fac.parts if p.where == f"S{n}" and p.kind == "Стойка"), None)
+    return p.article if p else ""
+
+
+def depth_of(system, art: str) -> float:
+    r = next((r for r in system.profiles if norm_art(r["Шифр"]) == norm_art(art)), None)
+    return to_float(r["Габарит, мм"]) or 0.0 if r else 0.0
 
 
 def mark_geometry(kind: str, fac, mark: str, span) -> dict:
@@ -133,8 +119,7 @@ def mark_geometry(kind: str, fac, mark: str, span) -> dict:
 
 
 def mark_requirements(kind: str, fac, mark: str, spans) -> dict | None:
-    """Требуемые моменты для марки: Лора считает в фоне по геометрии марки
-    (сеанс - её последний). None - расчёт недоступен."""
+    """Требуемые моменты для марки: Лора считает в фоне по геометрии марки. None - расчёт недоступен."""
     if not LORA_CALC.exists():
         return None
     geoms = [mark_geometry(kind, fac, mark, s) for s in spans] if spans \
@@ -160,32 +145,55 @@ def mark_requirements(kind: str, fac, mark: str, spans) -> dict | None:
 
 
 def post_min_depth(system, fac, mark: str) -> float:
-    """Минимально допустимая глубина стойки: не меньше глубины самого глубокого ригеля,
-    примыкающего к стойке (слева/справа, по всей её высоте)."""
+    """Минимально допустимая глубина стойки: не меньше глубины самого глубокого примыкающего ригеля."""
     n = int(mark[1:])
     px = fac.post_x[n - 1]
-    depth = {norm_art(r["Шифр"]): to_float(r["Габарит, мм"]) or 0.0 for r in system.profiles}
     arts = [a for (y, xl, xr), a in fac.beam_art.items() if xl == px or xr == px]
-    return max((depth.get(norm_art(a), 0.0) for a in arts), default=0.0)
+    return max((depth_of(system, a) for a in arts), default=0.0)
 
 
-def allowed_profiles(system, lib, fac, mark: str, kind: str, spans) -> tuple[list[tuple[str, str]], bool]:
-    """Допустимые профиля (жёстко): тип, блок в библиотеке, для ригеля - закладная под вес марки,
-    для стойки - глубина не меньше примыкающих ригелей, моменты не ниже требуемых (Лора, фон).
-    Возвращает ([(артикул, расшифровка)], статика_учтена)."""
+def beam_cap(system, fac, mark: str, spans) -> float:
+    """Максимально допустимая глубина ригеля: не больше глубины самой мелкой примыкающей стойки."""
+    caps = []
+    for y, xl, xr in spans:
+        try:
+            ia, ib = fac.post_x.index(xl) + 1, fac.post_x.index(xr) + 1
+        except ValueError:
+            continue
+        caps.append(min(depth_of(system, post_art(fac, ia)), depth_of(system, post_art(fac, ib)) or 1e9))
+    return min(caps, default=0.0)
+
+
+def merged_options(system, lib, picks) -> tuple[list[tuple[str, str]], bool]:
+    """Один список допустимых профилей для всех выбранных марок - по самой нагруженной.
+    picks - [(витраж, марка, kind, fac, span)]. Возвращает ([(артикул, расшифровка)], статика_учтена)."""
+    kind = picks[0][2]
     rows = [r for r in system.profiles if r["Тип"] == kind and r["Группа"] != "фальш"]
     if lib is not None:
         rows = [r for r in rows if lib.has(r["Шифр"])]
     if kind == "стойка":
-        min_d = post_min_depth(system, fac, mark)
+        min_d = max((post_min_depth(system, fac, mark) for _v, mark, _k, fac, _s in picks), default=0.0)
         if min_d:
             rows = [r for r in rows if (to_float(r["Габарит, мм"]) or 0.0) >= min_d]
-    if kind == "ригель":
-        wt = mark_weight(fac, mark, spans)
+    else:
+        cap = min((beam_cap(system, fac, mark, spans_of_mark(fac, mark)) or 1e9
+                   for _v, mark, _k, fac, _s in picks), default=1e9)
+        if cap < 1e9:
+            rows = [r for r in rows if (to_float(r["Габарит, мм"]) or 0.0) <= cap + 1e-6]
+        wt = max((mark_weight(fac, mark, spans_of_mark(fac, mark)) for _v, mark, _k, fac, _s in picks),
+                 default=0.0)
         holes = fixing_holes(Statics(system, Path(".")), wt)
         allow = beams_with_fixing(system, holes) if holes else set()
         rows = [r for r in rows if norm_art(r["Шифр"]) in allow]
-    reqs = mark_requirements(kind, fac, mark, spans)
+    reqs: dict[str, float] = {}
+    stat_ok = True
+    for _v, mark, _k, fac, span in picks:
+        r = mark_requirements(kind, fac, mark, spans_of_mark(fac, mark) if kind == "ригель" else [])
+        if r is None:
+            stat_ok = False
+            continue
+        for k2, v in r.items():
+            reqs[k2] = max(reqs.get(k2, 0.0), v)
     if reqs:
         jx_k = "стойка_треб_ix_см4" if kind == "стойка" else "ригель_треб_ix_см4"
         wx_k = "стойка_треб_wx_см3" if kind == "стойка" else "ригель_треб_wx_см3"
@@ -195,18 +203,75 @@ def allowed_profiles(system, lib, fac, mark: str, kind: str, spans) -> tuple[lis
             rows = [r for r in rows if (to_float(r["Jy"]) or 0.0) >= reqs["ригель_треб_iy_см4"]]
     rows.sort(key=lambda r: to_float(r["Габарит, мм"]) or 0.0)
     return [(r["Шифр"], f'{r["Группа"]}, габарит {r["Габарит, мм"]} мм, {r["Масса 1м, кг"]} кг/м, '
-                         f'Jx={r["Jx"]}, Jy={r["Jy"]}, Wx={r["Wx"]} (стр. {r["Стр."]})') for r in rows], bool(reqs)
+                         f'Jx={r["Jx"]}, Jy={r["Jy"]}, Wx={r["Wx"]} (стр. {r["Стр."]})') for r in rows], stat_ok
 
 
 def current_article(kind: str, fac, mark: str, span) -> str:
     if kind == "стойка":
-        p = next((p for p in fac.parts if p.where == mark and p.kind == "Стойка"), None)
-        return p.article if p else ""
+        return post_art(fac, int(mark[1:]))
     return fac.beam_art.get((round(span[0], 3), span[1], span[2]), "") if span else ""
 
 
+def locate(sel, facs, kind: str) -> tuple[list, int]:
+    """Выбранные полилинии -> [(имя витража, марка, kind, fac, span)] своего вида; пропуски - число."""
+    picks, skipped, seen = [], 0, set()
+    for _layer, x0, y0, x1, y1 in sel:
+        xc, yc = (x0 + x1) / 2, (y0 + y1) / 2
+        vertical = abs(x1 - x0) <= abs(y1 - y0)
+        if (kind == "стойка") != vertical:
+            skipped += 1                      # не тот вид - пропуск
+            continue
+        for _g, obj, fac, _owner in facs:
+            gx0, gy0, gx1, gy1 = bbox(_g)
+            if not (gx0 - TOL <= xc <= gx1 + TOL and gy0 - TOL <= yc <= gy1 + TOL):
+                continue
+            if vertical:
+                px = min(fac.post_x, key=lambda p: abs(p - xc))
+                if abs(px - xc) < TOL:
+                    mark = f"S{fac.post_x.index(px) + 1}"
+                    key = (obj.имя, mark)
+                    if key not in seen:
+                        seen.add(key)
+                        picks.append((obj.имя, mark, "стойка", fac, None))
+            else:
+                spans = [(y, xl, xr, mk) for y, xl, xr, mk in (fac.marks or [])
+                         if mk.startswith("R") and abs(y - yc) < TOL and xl - 1 <= xc <= xr + 1]
+                if spans:
+                    y, xl, xr, mk = max(spans, key=lambda s: s[2] - s[1])
+                    key = (obj.имя, mk, y, xl, xr)
+                    if key not in seen:
+                        seen.add(key)
+                        picks.append((obj.имя, mk, "ригель", fac, (y, xl, xr)))
+            break
+    return picks, skipped
+
+
+def plan_edits(picks) -> tuple[list, list]:
+    """Полная марка меняет артикул; при выборе части её пролётов создаётся новая марка."""
+    grouped = {}
+    for v, mark, _kind, fac, span in picks:
+        grouped.setdefault((v, mark), (fac, []))
+        if span not in grouped[(v, mark)][1]:
+            grouped[(v, mark)][1].append(span)
+    used = {m for _v, _m, _k, fac, _s in picks for *_coords, m in fac.marks}
+    edits, additions = [], []
+    for (v, mark), (fac, selected) in grouped.items():
+        all_spans = spans_of_mark(fac, mark)
+        if selected[0] is None or len(selected) == len(all_spans):
+            edits.append((v, mark))
+            continue
+        suffix = re.match(r"R\d+(.*)$", mark).group(1)
+        n = 2
+        while f"R{n}{suffix}" in used:
+            n += 1
+        new_mark = f"R{n}{suffix}"
+        used.add(new_mark)
+        additions.append((v, mark, new_mark, selected))
+    return edits, additions
+
+
 def main():
-    sel = read_selection()
+    kind, sel = read_selection()
     if not sel:
         print("Ничего не выбрано.")
         return
@@ -224,61 +289,96 @@ def main():
     groups = split_axes(axes, system.card["система"]["ширина_профиля"] + 1)
     owners = assign_blocks(groups, blocks)
     tables = parse_profile_tables(lines)
+    spans = parse_profile_spans(lines)
 
     defaults = ObjectParams(заполнение=50, вариант="", выпуск_низ=20, выпуск_верх=10)
-    facs = []
+    facs, glass_no = [], 0
     for g, owner in zip(groups, owners):
         attrs = owner[2] if owner else {}
         obj, _warn = params_from_attrs(defaults, attrs)
-        obj = replace(obj, имя=attrs.get("ИМЯ", f"ВТ-{len(facs) + 1}?"))
+        obj = replace(obj, имя=attrs.get("ИМЯ", f"ВТ-{len(facs) + 1}?"),
+                      профили=tables.get(obj.имя, {}), пролеты=spans.get(obj.имя, {}))
         gx0, gy0, gx1, gy1 = bbox(g)
         mk = [m for m in markers if gx0 - 100 < m[0] < gx1 + 100 and gy0 - 100 < m[1] < gy1 + 100]
         fac = build(g, system, obj, mk)
-        facs.append((g, replace(obj, профили=tables.get(obj.имя, {})), fac, owner))
-    # build с правками (для current_article)
-    facs = [(g, obj, build(g, system, obj, [m for m in markers
-            if bbox(g)[0] - 100 < m[0] < bbox(g)[2] + 100 and bbox(g)[1] - 100 < m[1] < bbox(g)[3] + 100]), ow)
-            for g, obj, _f0, ow in facs]
+        for gl in fac.glasses:
+            glass_no += 1
+            gl.mark = f"{gl.kind}_{glass_no:02d}"
+        facs.append((g, obj, fac, owner))
 
     _, lib = load(system, systems_dir)
-
-    picks = locate(sel, facs)
+    picks, skipped = locate(sel, facs, kind)
     if not picks:
-        print("Полилинии не попали ни в одну марку - ничего не заменено.")
+        print(f"Полилинии не попали ни в одну марку ({'стойки' if kind == 'стойка' else 'ригели'}"
+              f"{', пропущено чужого вида: ' + str(skipped) if skipped else ''}).")
         return
-    print("Марки:", ", ".join(f"{v}: {m}" for v, m, *_ in picks))
+    if skipped:
+        print(f"Пропущено полилиний другого вида: {skipped}")
+    print(f"Марки ({kind}):", ", ".join(f"{v}:{m}" for v, m, *_ in picks))
 
-    edits = []
-    for vname, mark, kind, fac, span in picks:
-        spans = spans_of_mark(fac, mark) if kind == "ригель" else []
-        opts, stat_ok = allowed_profiles(system, lib, fac, mark, kind, spans)
-        if not opts:
-            from tkinter import messagebox
-            geo = "глубина не меньше примыкающих ригелей" if kind == "стойка" else "закладная под вес"
-            why = f"блок в библиотеке / {geo} / моменты по расчёту Лоры" if stat_ok \
-                else f"блок в библиотеке / {geo} (Лора недоступна - моменты не проверены)"
-            messagebox.showwarning("Замена профиля",
-                                   f"{vname}, марка {mark}: нет допустимых профилей {kind}\n({why}) - пропуск")
-            continue
-        title = f"Замена профиля: {mark}  ({kind}, {vname})"
-        if kind == "ригель":
-            title += f"   вес на марке {mark_weight(fac, mark, spans):g} кг"
-        if not stat_ok:
-            title += "   (статика не учтена - Лора недоступна)"
-        choice = ask_profile(title, opts, current_article(kind, fac, mark, span))
-        if choice:
-            edits.append((vname, mark, choice))
-            print(f"  {mark} -> {choice}")
-
-    if not edits:
-        print("Замен не выбрано - чертёж не менялся.")
+    opts, stat_ok = merged_options(system, lib, picks)
+    if not opts:
+        from tkinter import messagebox
+        geo = ("глубина в пределах примыкающих стоек / закладная под вес" if kind == "ригель"
+               else "глубина не меньше примыкающих ригелей")
+        why = f"блок в библиотеке / {geo} / моменты по расчёту Лоры" if stat_ok \
+            else f"блок в библиотеке / {geo} (Лора недоступна - моменты не проверены)"
+        messagebox.showwarning("Замена профиля",
+                               f"Нет допустимых профилей {kind} для выбранных марок\n({why})")
         return
-    res = acad.run_lisp(set_profile_code(edits), timeout=60)
-    print("Таблица профилей:", res)
+    cur = current_article(kind, picks[0][3], picks[0][1], picks[0][4])
+    wt_txt = ""
+    if kind == "ригель":
+        wt = max(mark_weight(fac, mark, spans_of_mark(fac, mark)) for _v, mark, _k, fac, _s in picks)
+        wt_txt = f"   вес до {wt:g} кг"
+    title = f"Замена {kind}: {', '.join(m for _, m, *_ in picks)}{wt_txt}"
+    if not stat_ok:
+        title += "   (статика не учтена - Лора недоступна)"
+    choice = ask_profile(title, opts, cur)
+    if not choice:
+        print("Замена отменена - чертёж не менялся.")
+        return
+    edit_keys, additions = plan_edits(picks)
+    edits = [(v, m, choice) for v, m in edit_keys]
+    print("  ->", choice)
+    targets = {(v, m) for v, m in edit_keys} | {(v, old) for v, old, _new, _spans in additions}
+    legacy = False
+    for _x, _y, attrs, _handle in parse_blocks(lines, "P"):
+        marks = [m.strip() for m in attrs.get("МАРКА", "").split(",") if m.strip()]
+        if len(marks) > 1 and any((attrs.get("ВИТРАЖ", ""), m) in targets for m in marks):
+            legacy = True
+    if legacy:
+        print("Обновление старой таблицы: отдельная строка для каждой марки")
+        postroit_vse(acad, system, defaults, systems_dir)
+    for v, old, new, selected in additions:
+        source = next((row for row in parse_blocks(lines, "P")
+                       if row[2].get("ВИТРАЖ") == v
+                       and old in [m.strip() for m in row[2].get("МАРКА", "").split(",")]), None)
+        if source is None:
+            report(f"Замена {kind} - не выполнена", [f"Не найдена строка {old} для разделения на {new}"], [])
+            return
+        x, y, attrs, _handle = source
+        values = dict(attrs)
+        values.update({"МАРКА": new, "АРТИКУЛ": choice, "КОЛ": str(len(selected)),
+                       "ПРОЛЕТ": spans_code(selected)})
+        print(f"  {old} -> {new}: пролётов {len(selected)}")
+        res = acad.run_lisp(add_profile_row_code(x, y, values), timeout=60)
+        if res != "ок":
+            report(f"Замена {kind} - не выполнена", [f"Новая строка {new}: {res}"], [])
+            return
+    if edits:
+        res = acad.run_lisp(set_profile_code(edits), timeout=60)
+        print("Таблица профилей:", res)
+        if res != f"правок {len(edits)}":
+            report(f"Замена {kind} - не выполнена",
+                   [f"Таблица профилей: {res}, ожидалось правок: {len(edits)}",
+                    "Чертёж не перестраивался. Проверьте таблицу профилей."], [])
+            return
     result = postroit_vse(acad, system, defaults, systems_dir)
     warns = [f"{o.имя}: {w}" for o, f in result for w in f.warnings]
-    report("Замена профиля - готово",
-           [f"Заменено: {len(edits)}"] + [f"{v}, {m} -> {a}" for v, m, a in edits], warns)
+    report_edits = edits + [(v, new, choice) for v, _old, new, _selected in additions]
+    report(f"Замена {kind} - готово",
+           [f"Марок заменено: {len(report_edits)} ({kind})"] + [f"{v}, {m} -> {choice}" for v, m, _ in report_edits], warns)
 
 
 if __name__ == "__main__":

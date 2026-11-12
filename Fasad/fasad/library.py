@@ -22,8 +22,9 @@ from . import rules as R
 from .facade import parse_items, pick_filler
 from .nodes import Place, to_world
 
-CACHE_VERSION = 6
+CACHE_VERSION = 7
 ROW = re.compile(r"^\s*(.+?)\s+(\d+)\s*мм\s*$")
+MIX = re.compile(r"^разница\s*(\d+)\s*мм$", re.IGNORECASE)   # узлы "сочетание разных заполнений"
 
 
 @dataclass
@@ -40,6 +41,7 @@ class LibNode:
     g_in: float
     g_lat: float
     where: str                       # подпись + координаты в файле - для замечаний
+    diff: int = 0                    # смешанный узел "сочетание заполнений": разница толщин, мм (0 - обычный)
     labeled: bool = False            # из исправленного атласа (подпись "вариант NN мм") - свежее
 
 
@@ -87,7 +89,11 @@ def _labels(doc) -> tuple[list, list]:
         m = ROW.match(t)
         if m and not t.lower().startswith(("стойка", "ригель")):
             rows.append((x, y, m.group(1).strip(), int(m.group(2))))
-        elif t.lower().startswith(("стойка", "ригель")):
+        else:
+            mx = MIX.match(t)
+            if mx:
+                rows.append((x, y, "Разница", int(mx.group(1))))   # смешанный узел: "Разница 24мм"
+        if t.lower().startswith(("стойка", "ригель")):
             cells.append((x, y, t))
     return rows, cells
 
@@ -138,7 +144,7 @@ def read_library(path: Path, system) -> tuple[list[LibNode], R.Library, list[str
         nodes.append(LibNode(var, s.thick, s.beam, s.edge, s.profile, s.profile_place,
                              [(i.name, i.place) for i in s.items if i.place],
                              [i.box for i in s.items if i.place is None], stack, s.g_in, s.g_lat, where,
-                             labeled=bool(row)))
+                             s.thick - s.thick2 if s.thick2 else 0, labeled=bool(row)))
     return nodes, lib, notes
 
 
@@ -146,14 +152,15 @@ def _to_json(n: LibNode) -> dict:
     pl = lambda p: [p.name, p.x, p.y, p.rot, p.mirror]
     return {"вариант": n.variant, "толщина": n.thick, "ригель": n.beam, "крайний": n.edge, "профиль": n.profile,
             "профиль_вставка": pl(n.profile_place), "детали": [pl(p) for _, p in n.items], "подкладки": n.pads,
-            "доборные": list(n.stack), "стекло_внутр": n.g_in, "кромка": n.g_lat, "где": n.where, "атлас": n.labeled}
+            "доборные": list(n.stack), "стекло_внутр": n.g_in, "кромка": n.g_lat, "где": n.where, "атлас": n.labeled,
+            "разница": n.diff}
 
 
 def _from_json(d: dict) -> LibNode:
     pl = lambda a: Place(a[0], a[1], a[2], a[3], a[4])
     return LibNode(d["вариант"], d["толщина"], d["ригель"], d["крайний"], d["профиль"], pl(d["профиль_вставка"]),
                    [(a[0], pl(a)) for a in d["детали"]], [tuple(b) for b in d["подкладки"]], tuple(d["доборные"]),
-                   d["стекло_внутр"], d["кромка"], d["где"], d["атлас"])
+                   d["стекло_внутр"], d["кромка"], d["где"], int(d.get("разница", 0)), d["атлас"])
 
 
 def library_path(system) -> Path | None:

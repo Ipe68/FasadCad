@@ -63,6 +63,10 @@ class ObjectParams:
     фальш_ригель: str = ""                      # оси OSf; "" - по карточке (в системе один, КПС 009)
     # правки из таблицы профилей: марка -> (артикул, (артикул по правилам, длина по правилам))
     профили: dict = field(default_factory=dict)
+    # закрепление марок за пролётами: марка -> [(y, x_лев, x_прав)]; нужно при разделении марки
+    пролеты: dict = field(default_factory=dict)
+    # замены заполнения из таблицы ФАСАД_ЗАПОЛНЕНИЕ: марка стекла -> {заполнение, формула, вариант}
+    заполнения: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -124,8 +128,9 @@ class Facade:
     post_ends: dict = field(default_factory=dict)           # ось стойки -> (низ, верх) стойки
     beam_spans: list[tuple] = field(default_factory=list)   # (y, x_лев, x_прав, шифр закладной, ригель)
     beam_art: dict = field(default_factory=dict)            # (y, x_лев, x_прав) -> артикул ригеля пролёта
+    extra_sections: list = field(default_factory=list)      # линии ДОБАВИТЬСЕЧЕНИЕ: (x1, y1, x2, y2)
     false_spans: list[tuple] = field(default_factory=list)  # фальш-ригели (y, x_лев, x_прав, артикул)
-    marks: list[tuple] = field(default_factory=list)        # (y, x_лев, x_прав, марка) - по правилам, до правок таблицы
+    marks: list[tuple] = field(default_factory=list)        # (y, x_лев, x_прав, марка), с учётом разделения по пролётам
     profile_rows: list[dict] = field(default_factory=list)  # строки таблицы профилей
     bays: dict = field(default_factory=dict)                # (x_лев, x_прав) -> отметки ригелей
     floor_bays: set = field(default_factory=set)            # пролёты без нижнего ригеля
@@ -142,6 +147,17 @@ class System:
     openings: dict = field(default_factory=dict)
     folder: Path | None = None
     profiles: list[dict] = field(default_factory=list)      # стойки и ригели (каталог стр. 10-11)
+    combinations: list[dict] = field(default_factory=list)  # сочетание разных заполнений: разница -> доборные
+
+    def combo(self, diff) -> dict | None:
+        """Дополнительные комплектующие для сочетания заполнений по разнице толщин, мм.
+        Сторона меньшего заполнения; узел строится по большей толщине (каталог, лист 'Сочетание')."""
+        try:
+            d = int(float(str(diff).replace(",", ".")))
+        except ValueError:
+            return None
+        return next((r for r in self.combinations
+                     if int(float(str(r.get("Разница, мм", "")).replace(",", "."))) == d), None)
 
     def profile(self, article: str) -> dict | None:
         return next((r for r in self.profiles if r["Шифр"] == article), None)
@@ -215,7 +231,8 @@ def load_system(folder: str | Path, name: str) -> System:
                   _read_csv(folder / f"{name}_периметр.csv"),
                   _read_csv(inserts_file) if inserts_file.exists() else [], openings, folder,
                   _read_csv(folder / f"{name}_стойки_ригели.csv") if (folder / f"{name}_стойки_ригели.csv").exists()
-                  else [])
+                  else [],
+                  _read_csv(folder / f"{name}_сочетание.csv"))
 
 
 _ITEM = re.compile(r"^(?P<art>.+?)\s*(?:\((?P<note>[^)]*)\))?\s*(?:[xх×]\s*(?P<qty>\d+))?$")
@@ -377,14 +394,22 @@ def build(axes: list[Axis], system: System, obj: ObjectParams,
 
     Артикулы - по исходным данным витража (стойка, ригель); исключения - таблица профилей
     (например, верхний пояс из стоечного профиля: в строке R1_в вписать артикул стойки).
-    Марки считаются по этим правилам и от правок таблицы профилей не меняются: правка в таблице
-    ("R1 -> КПС 998") меняет только артикул деталей этой марки. Правка применяется, только пока
+    Марки считаются по правилам; сохранённые пролёты позволяют разделить марку при замене только
+    части одинаковых ригелей. Правка применяется, только пока
     марка совпадает с записанной базой; предупреждение - только о реальной ручной правке
     (артикул в таблице отличен от базы), смена профиля в окне таблицу молча перезаписывает."""
     from .marks import compute_marks
 
     fac = _build(axes, system, obj, markers, {})
     fac.marks = compute_marks(fac, system)
+    if obj.пролеты:
+        at = {(round(y, 3), xl, xr): i for i, (y, xl, xr, _m) in enumerate(fac.marks)}
+        for mark, spans in obj.пролеты.items():
+            for y, xl, xr in spans:
+                i = at.get((round(y, 3), xl, xr))
+                if i is not None:
+                    y0, xl0, xr0, _old = fac.marks[i]
+                    fac.marks[i] = (y0, xl0, xr0, mark)
     base = _mark_spans(fac)                       # марка -> (ключи, длина, артикул) по правилам
     force, warn = {}, []
     for mark, (art, (b_art, b_len)) in obj.профили.items():
@@ -712,27 +737,25 @@ def _build(axes: list[Axis], system: System, obj: ObjectParams,
         fac.beam_spans.append((y, xl, xr, code or ins_name, b_art))
         fix_count[rule["крепеж"]] = fix_count.get(rule["крепеж"], 0) + zk["на_ригель"]
         ins_count[ins_name] = ins_count.get(ins_name, 0) + zk["на_ригель"]
-        if rule.get("тяжелый") and not kit["Вариант"].startswith("Тяжелые"):
-            if not _has_heavy_kit(system, obj.заполнение):
-                fac.warnings.append(f"Ригель {where}: стекло {wt:g} кг - нужны подкладки КПС 846/1126, "
-                                    f"а для толщины {obj.заполнение} мм они не предусмотрены - "
-                                    f"измените толщину пакета (40-48 мм - КПС 846, 52-58 мм - КПС 1126)")
-            else:
-                need = "КПС 846 (40-48 мм)" if obj.заполнение <= 48 else "КПС 1126 (52-58 мм)"
-                fac.warnings.append(f"Ригель {where}: стекло {wt:g} кг - нужны подкладки {need}, "
-                                    f"а выбран вариант \"{kit['Вариант']}\"")
-    # опорные подкладки по весу стекла: тяжёлый комплект - только под тяжёлыми пакетами
-    light_pads = ""
-    light_variant = card.get("подкладки_по_весу", {}).get(str(kit.get("Вариант", "")))
-    if light_variant:
+        if rule.get("тяжелый") and not _has_heavy_kit(system, obj.заполнение):
+            fac.warnings.append(f"Ригель {where}: стекло {wt:g} кг - нужны подкладки КПС 846/1126, "
+                                f"а для толщины {obj.заполнение} мм они не предусмотрены - "
+                                f"измените толщину пакета (40-48 мм - КПС 846, 52-58 мм - КПС 1126)")
+    # опорные подкладки по весу стекла: под тяжёлым - комплект из "Тяжелой" строки этой толщины
+    # (вариант "Тяжелые" выбирать не нужен: это источник подкладок, как закладные - деталь ригеля)
+    def _tint(v) -> int | None:
         try:
-            light_pads = system.kit(obj.заполнение, light_variant).get("Подкладка опорная", "")
+            return int(float(str(v).replace(",", ".")))
         except ValueError:
-            fac.warnings.append(f"Подкладки: лёгкий вариант \"{light_variant}\" не найден для толщины "
-                                f"{obj.заполнение} мм - под всеми стёклами тяжёлые")
-    heavy_pads = kit.get("Подкладка опорная", "")
+            return None
+    heavy_pads = ""
+    for r in system.kits:
+        if _tint(r.get("Толщина")) == obj.заполнение and str(r.get("Вариант", "")).startswith("Тяжелые"):
+            heavy_pads = r.get("Подкладка опорная", "")
+            break
+    light_pads = kit.get("Подкладка опорная", "")
     for gl in fac.glasses:
-        gl.pads = (heavy_pads if _pad_heavy(gl.weight, card) else light_pads) or heavy_pads
+        gl.pads = (heavy_pads or light_pads) if _pad_heavy(gl.weight, card) else light_pads
     for y, xl, xr, f_art in fac.false_spans:           # фальш-ригель стекло не несёт - под винты
         ins = system.insert(f_art, "с")
         name = f'{ins["Шифр"]} (L={ins["L, мм"]}, стр. {ins["Стр."]})' if ins else f"закладная для {f_art} (УТОЧНИТЬ)"

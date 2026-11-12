@@ -23,46 +23,41 @@ def _interp_by_table(x, points):
 
 
 def calculate_k1_k2(l1, l2, h_m):
-    """Расчет коэффициентов k1/k2 по таблицам (k1_k2.xlsx / Формулы и таблицы C66:E66, I66)."""
-    max_l = max(l1, l2)  # G34
+    """Коэффициенты k1, k2 прогиба кромки стеклопакета - как в листе 'Формулы и таблицы' СТАТИКИ
+    (G36, H36, I36 = k1*k2; таблицы C57:F65 и H56:I65). Применяются ТОЛЬКО к требуемому моменту
+    инерции стойки (E39/E40) и только при включённом параметре 'Учитывать коэф. k1 и k2'.
+    На нагрузки они не влияют."""
+    max_l = max(l1, l2)  # G34 - высота высокого стеклопакета
     max_l_cm = max_l / 10.0
     ratio_l_h = (max_l / h_m) if h_m else 0.0  # H34 = G34/F7
 
-    # Таблица по длине L2 (см)
-    # B58:B65 и C58:C65 / D58:D65 / E58:E65; H56:H65 и I56:I65
+    # k1: B58:B65 - L2 (см); столбцы C (L2/H >= 1), D (1 > L2/H >= 0,75), E (0,75 > L2/H >= 0,66)
     base_lengths_cm = [250, 300, 350, 400, 450, 500, 550, 600]
     k1_col_c = [1.04, 1.24, 1.45, 1.67, 1.87, 2.08, 2.29, 2.49]
     k1_col_d = [1.00, 1.00, 1.00, 1.00, 1.05, 1.17, 1.28, 1.40]
     k1_col_e = [1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.01, 1.11]
-    k2_col = [1.04, 1.25, 1.46, 1.67, 1.87, 2.08, 2.29, 2.49]
+    # k2: H56:I65 (после 400 см значение не растёт - как в СТАТИКЕ, I65)
+    k2_len_cm = [250, 260, 270, 280, 290, 300, 325, 350, 375, 400]
+    k2_val = [1.04, 1.08, 1.12, 1.17, 1.21, 1.25, 1.35, 1.46, 1.56, 1.67]
 
     if max_l_cm < 250:
-        k1 = 1.0
-        k2 = 1.0
-        return {'k1': k1, 'k2': k2}
+        return {'k1': 1.0, 'k2': 1.0}
 
-    points_c = list(zip(base_lengths_cm, k1_col_c))
-    points_d = list(zip(base_lengths_cm, k1_col_d))
-    points_e = list(zip(base_lengths_cm, k1_col_e))
-    points_k2 = list(zip(base_lengths_cm, k2_col))
-
-    k1_c = _interp_by_table(max_l_cm, points_c)
-    k1_d = _interp_by_table(max_l_cm, points_d)
-    k1_e = _interp_by_table(max_l_cm, points_e)
-
-    # Выбор столбца k1 по отношению L2/H (H34)
-    if ratio_l_h >= 0.75:
-        k1 = k1_c
+    # G36 = IF(H34>=1, C66, IF(AND(H34>=0.75, H34<1), D66, IF(AND(H34>=0.66, H34<0.75), E66, 1)))
+    if ratio_l_h >= 1.0:
+        k1 = _interp_by_table(max_l_cm, list(zip(base_lengths_cm, k1_col_c)))
+    elif ratio_l_h >= 0.75:
+        k1 = _interp_by_table(max_l_cm, list(zip(base_lengths_cm, k1_col_d)))
     elif ratio_l_h >= 0.66:
-        k1 = k1_d
-    elif ratio_l_h >= 0.5:
-        k1 = k1_e
+        k1 = _interp_by_table(max_l_cm, list(zip(base_lengths_cm, k1_col_e)))
     else:
         k1 = 1.0
 
-    k2 = _interp_by_table(max_l_cm, points_k2)
+    k2 = _interp_by_table(max_l_cm, list(zip(k2_len_cm, k2_val)))
 
-    return {'k1': round(k1, 2), 'k2': round(k2, 2)}
+    # В СТАТИКЕ k1 округляется до 0,01 (C66:E66), k2 (I66) не округляется
+    return {'k1': round(k1, 2), 'k2': k2}
+
 
 def get_kz_zeta(ze, terrain):
     """Интерполяция kz и zeta по таблицам из 'ветер СП' листа СТАТИКА .xlsx"""
@@ -195,7 +190,7 @@ def calculate_glass_weight(l1, b2, t_glass):
     
     return round(f19, 5)
 
-def calculate_mullion_requirements(q_norm, q_calc, h_m, b1, r_calc, is_single_span, railing_enabled, railing_norm_kn, safety_yn, mullion_deflection_ratio=200.0):
+def calculate_mullion_requirements(q_norm, q_calc, h_m, b1, r_calc, is_single_span, railing_enabled, railing_norm_kn, safety_yn, mullion_deflection_ratio=200.0, k_edge=1.0):
     """Требуемые характеристики стойки по формулам E38/E39/E40 листа 'Формулы и таблицы'."""
     e_module = 70000.0  # K13
 
@@ -225,11 +220,11 @@ def calculate_mullion_requirements(q_norm, q_calc, h_m, b1, r_calc, is_single_sp
             j25 = railing_norm_kn * b1 * g14 * (g16 - g14) * g20 * g21 / (g16 * g22 * 1000.0)
             wx_req += j25
 
-    # E39/E40
+    # E39/E40: основная часть умножается на k1*k2 (I36) при включённом параметре F14 (k_edge = k1*k2, иначе 1)
     if is_single_span:
-        ix_req = (5.0 * (1.0 / k14) * q_norm * (h_m ** 3)) / (384.0 * e_module * 10000.0)
+        ix_req = (5.0 * (1.0 / k14) * q_norm * (h_m ** 3)) / (384.0 * e_module * 10000.0) * k_edge
     else:
-        ix_req = ((1.0 / k14) * q_norm * (h_m ** 3)) / (185.0 * e_module * 10000.0)
+        ix_req = ((1.0 / k14) * q_norm * (h_m ** 3)) / (185.0 * e_module * 10000.0) * k_edge
 
     # Добавка от перильной нагрузки (J24) только для однопролетной схемы и включенной перильной нагрузки
     # J24 = G12*G13*G14*(3*(G16)^2-4*(G14)^2)*G17/(48*G18*10000*G19)
@@ -249,7 +244,8 @@ def calculate_mullion_requirements(q_norm, q_calc, h_m, b1, r_calc, is_single_sp
         'f_allow': round(f_allow, 1),
         'is_single_span': is_single_span,
         'k10': k10,
-        'k14': k14
+        'k14': k14,
+        'k_edge': k_edge
     }
 
 def calculate_transom_requirements(q_wind_norm, q_wind_calc, b2, l1, l2, angle_deg, t_glass, a_pad, f_allow_weight, r_calc, safety_yn, is_single_span, railing_enabled):
@@ -354,3 +350,271 @@ def calculate_transom_requirements(q_wind_norm, q_wind_calc, b2, l1, l2, angle_d
         'f_allow_wind': round(f_allow_wind, 2),
         'f_allow_weight': round(f_allow_weight_eff, 2),
     }
+
+
+# ---------------------------------------------------------------------------
+# Проверка прочности по формулам примера отчёта (СП 128.13330.2016)
+#   стойка  : (N/A + Mx/Wx) / (Ryn * gamma_c) <= 1   (сжато-изгибаемый элемент)
+#   ригель  : (Mx/Wx + My/Wy) / (Ryn * gamma_c) <= 1 (изгиб в двух плоскостях)
+# ---------------------------------------------------------------------------
+G_ACC = 9.81          # ускорение свободного падения, м/с2
+GAMMA_F_SELF = 1.1    # коэф. надёжности по нагрузке от собственного веса профиля
+GAMMA_C = 1.0         # коэф. условий работы (табл. 6 СП 128.13330.2016, как в примере)
+GAMMA_F_RAIL = 1.2    # коэф. надёжности для перильной нагрузки
+
+
+def _transom_self_weight_kn_m(profile, b2):
+    """Погонный вес ригеля, кН/м: по массе профиля, иначе приближённо как в расчёте прогибов."""
+    mass = profile.get('mass')
+    if mass:
+        return mass * G_ACC / 1000.0, True
+    return (0.02 if b2 < 2000.0 else (0.04 if b2 < 2700.0 else 0.065)), False
+
+
+def mullion_strength(profile, q_calc, h_m, b1, r_calc, safety_yn, angle_deg, qG_norm,
+                     k_glass, is_single_span, railing_enabled, railing_norm_kn=0.8,
+                     gamma_c=GAMMA_C):
+    """Прочность стойки. q_calc - расчётная погонная нагрузка (кН/м), h_m, b1 - мм, qG_norm - кН/м2.
+    Возвращает словарь с промежуточными величинами и коэффициентом использования 'util'."""
+    sin_a = math.sin(math.radians(angle_deg))
+    wx = profile.get('wx') or 0.0
+    area = profile.get('area') or 0.0
+    mass = profile.get('mass')
+    r_design = (r_calc / safety_yn) if (r_calc and safety_yn) else r_calc
+
+    # Продольная сила: собственный вес стойки + вес заполнения с грузовой площади
+    n_self = (mass or 0.0) * (h_m / 1000.0) * G_ACC * GAMMA_F_SELF * sin_a                 # Н
+    area_load = (b1 / 1000.0) * (h_m / 1000.0)                                             # м2
+    n_fill = qG_norm * k_glass * area_load * 1000.0 * sin_a                                # Н
+    n_tot = n_self + n_fill
+
+    # Изгибающий момент
+    m_wind = q_calc * (h_m / 1000.0) ** 2 / 8.0                                            # кН*м
+    m_rail = 0.0
+    ax = 0.0
+    if is_single_span and railing_enabled and h_m:
+        ax = min(1400.0, h_m / 2.0)
+        p_calc = railing_norm_kn * (b1 / 1000.0) * GAMMA_F_RAIL                            # кН
+        m_rail = p_calc * ax * (h_m - ax) / h_m / 1000.0                                   # кН*м
+    m_tot = m_wind + m_rail
+
+    sigma_n = n_tot / (area * 100.0) if area else 0.0                                      # МПа
+    sigma_m = m_tot * 1000.0 / wx if wx else float('inf')                                  # МПа
+    util = (sigma_n + sigma_m) / (r_design * gamma_c) if r_design else float('inf')
+    return {
+        'n_self': n_self, 'n_fill': n_fill, 'n': n_tot, 'area_load': area_load,
+        'm_wind': m_wind, 'm_rail': m_rail, 'm': m_tot, 'ax': ax,
+        'sigma_n': sigma_n, 'sigma_m': sigma_m, 'r_design': r_design, 'gamma_c': gamma_c,
+        'util': util, 'ok': util <= 1.0, 'mass_known': bool(mass), 'area_known': bool(area),
+    }
+
+
+def transom_strength(profile, q_calc, f6, b2, l1, l2, angle_deg, qG_norm, k_glass, a_pad,
+                     r_calc, safety_yn, is_single_span, railing_enabled, gamma_c=GAMMA_C):
+    """Прочность ригеля при изгибе в двух плоскостях.
+    Mx - от ветра/снега/стекла перпендикулярно фасаду (по грузовым площадям над и под ригелем),
+    My - в плоскости фасада от веса стеклопакета (две подкладки на расстоянии a от стоек) и собственного веса."""
+    sin_a = math.sin(math.radians(angle_deg))
+    wx = profile.get('wx') or 0.0
+    wy = profile.get('wy') or 0.0
+    r_design = (r_calc / safety_yn) if (r_calc and safety_yn) else r_calc
+
+    q_surf = (q_calc / f6) if f6 else 0.0            # кН/м2, делённое на 1000 (как в calculate_transom_requirements)
+
+    def side(li):
+        if b2 < li:
+            return q_surf * (b2 / 2.0) * ((0.001 * b2) ** 2) / 12.0
+        return (q_surf * (li / 2.0) * ((0.001 * b2) ** 2) / 8.0
+                - q_surf * (li / 2.0) * ((0.001 * li / 2.0) ** 2) / 6.0)
+
+    mx_load = side(l1) + side(l2)                                                            # кН*м
+    mx_rail = 0.0
+    if is_single_span and railing_enabled:
+        mx_rail = 0.8 * (b2 / 1000.0) ** 2 * GAMMA_F_RAIL / 8.0                              # кН*м
+    mx = mx_load + mx_rail
+
+    f_norm = sin_a * qG_norm * ((b2 - 25.0) / 1000.0) * ((l1 - 25.0) / 1000.0) / 2.0         # кН, на одну подкладку
+    f_calc = f_norm * k_glass
+    m_f = f_calc * a_pad / 1000.0                                                            # кН*м
+    q_self, mass_known = _transom_self_weight_kn_m(profile, b2)
+    q_self_y = q_self * GAMMA_F_SELF * sin_a                                                 # кН/м (в плоскости фасада)
+    m_q = q_self_y * (b2 / 1000.0) ** 2 / 8.0
+    my = m_f + m_q
+
+    sigma_x = mx * 1000.0 / wx if wx else float('inf')
+    sigma_y = my * 1000.0 / wy if wy else float('inf')
+    util = (sigma_x + sigma_y) / (r_design * gamma_c) if r_design else float('inf')
+    return {
+        'mx_load': mx_load, 'mx_rail': mx_rail, 'mx': mx,
+        'f_calc': f_calc, 'a': a_pad, 'm_f': m_f, 'q_self_y': q_self_y, 'm_q': m_q, 'my': my,
+        'sigma_x': sigma_x, 'sigma_y': sigma_y, 'r_design': r_design, 'gamma_c': gamma_c,
+        'util': util, 'ok': util <= 1.0, 'mass_known': mass_known,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Составное сечение «профиль + усилитель» (метод приведённого сечения).
+# Логика 1:1 повторяет new_profile_dialog.py (_update_totals_mullion / _update_totals_transom);
+# нужна, чтобы в отчёте показать промежуточные шаги расчёта итоговых характеристик.
+# ---------------------------------------------------------------------------
+E_ALUM = 70000.0      # модуль упругости алюминия, МПа
+E_STEEL = 210000.0    # модуль упругости стали, МПа
+N_STEEL = 3.0         # коэффициент приведения стали к алюминию, принятый в программе (E_ст/E_ал)
+RHO_ALUM = 2700.0     # плотность алюминия, кг/м3
+RHO_STEEL = 7850.0    # плотность стали, кг/м3
+
+
+def mass_per_m(area_cm2, material):
+    """Масса погонного метра по площади сечения, кг/м (A[см2] * rho[кг/м3] * 1e-4)."""
+    rho = RHO_STEEL if 'сталь' in str(material).lower() else RHO_ALUM
+    return (area_cm2 or 0.0) * rho * 1e-4
+
+
+def _wy_composite(iy_tot, b_b, bx_rein, ax_main, ax_rein):
+    max_bx = max(b_b, bx_rein) if bx_rein > 0 else b_b
+    if ax_main > 0 or ax_rein > 0:
+        cx_main = ax_main if ax_main > 0 else b_b / 2.0
+        cx_rein = ax_rein if ax_rein > 0 else (bx_rein / 2.0 if bx_rein > 0 else b_b / 2.0)
+        cx_max = max(cx_main, b_b - cx_main, cx_rein, bx_rein - cx_rein) if max_bx > 0 else 1.0
+        return (iy_tot / (cx_max / 10.0) if cx_max > 0 else 0.0), cx_max / 10.0
+    return (iy_tot / (max_bx / 20.0) if max_bx > 0 else 0.0), max_bx / 20.0
+
+
+def _wx_simple(ix_tot, h, ay):
+    if h <= 0:
+        return 0.0, 0.0
+    c_max = (max(ay, h - ay) / 10.0) if ay > 0 else h / 20.0
+    return (ix_tot / c_max if c_max > 0 else 0.0), c_max
+
+
+def composite_section(ix_b, iy_b, area_b, h_b, b_b, ay_main, ax_main,
+                      ix_r, iy_r, area_r, bx_rein, by_rein, ay_rein, ax_rein,
+                      material, pos, thermal=False, dist_user=0.0):
+    """Характеристики составного сечения. Единицы: см4, см2, мм (глубина h, ширина b, ay, ax, расстояния).
+    Возвращает словарь: итоговые ix_tot, iy_tot, wx_tot, wy_tot, area_tot и промежуточные величины
+    (n, dist_ct, y_c, d1, d2, y_min, y_max, c_top, c_bot, c_max, branch...)."""
+    mat = str(material).strip().lower()
+    pos = str(pos).strip().lower()
+    n = N_STEEL if "сталь" in mat else 1.0
+    r = {'n': n, 'pos': pos, 'mat': mat, 'dist_ct': 0.0, 'y_c': 0.0, 'd1': 0.0, 'd2': 0.0,
+         'y_min': 0.0, 'y_max': 0.0, 'c_top': 0.0, 'c_bot': 0.0, 'c_max': 0.0,
+         'a_red': area_b + n * area_r, 'steiner': False, 'branch': ''}
+
+    def finish(ix_tot, wx_tot, branch, steiner):
+        iy_tot = iy_b + n * iy_r
+        wy_tot, cx = _wy_composite(iy_tot, b_b, bx_rein, ax_main, ax_rein)
+        r.update(ix_tot=ix_tot, iy_tot=iy_tot, wx_tot=wx_tot, wy_tot=wy_tot, cx=cx,
+                 area_tot=area_b + n * area_r, branch=branch, steiner=steiner)
+        return r
+
+    def steiner(dist_ct, y_c, with_ay=True):
+        d1, d2 = y_c / 10.0, (dist_ct - y_c) / 10.0
+        r.update(dist_ct=dist_ct, y_c=y_c, d1=d1, d2=d2)
+        return (ix_b + area_b * d1 ** 2) + n * (ix_r + area_r * d2 ** 2)
+
+    def fibers(y_min, y_max, y_c):
+        c_top, c_bot = abs(y_max - y_c) / 10.0, abs(y_c - y_min) / 10.0
+        r.update(y_min=y_min, y_max=y_max, c_top=c_top, c_bot=c_bot, c_max=max(c_top, c_bot))
+        return max(c_top, c_bot)
+
+    def simple(branch):
+        ix_tot = ix_b + n * ix_r
+        wx_tot, c = _wx_simple(ix_tot, h_b, ay_main)
+        r['c_max'] = c
+        return finish(ix_tot, wx_tot, branch, False)
+
+    # --- режим терморазрыва: положение усилителя берётся из ay и расположения
+    if thermal and area_r > 0 and area_b > 0:
+        if "помещен" in pos:
+            dist_ct = ay_main + ay_rein
+        elif "улиц" in pos:
+            dist_ct = (h_b - ay_main) + ay_rein
+        else:
+            dist_ct = 0.0
+        if dist_ct > 0:
+            y_c = (n * area_r * dist_ct) / (area_b + n * area_r)
+            ix_tot = steiner(dist_ct, y_c)
+            if ay_main > 0 and ay_rein > 0:
+                y_min, y_max = min(-ay_main, dist_ct - ay_rein), max(h_b - ay_main, dist_ct + by_rein - ay_rein)
+            else:
+                y_min, y_max = min(-h_b / 2.0, dist_ct - by_rein / 2.0), max(h_b / 2.0, dist_ct + by_rein / 2.0)
+            c_max = fibers(y_min, y_max, y_c)
+            return finish(ix_tot, ix_tot / c_max if c_max > 0 else 0.0, 'thermal_offset', True)
+        return simple('thermal_coincident')
+
+    if area_r <= 0 or area_b <= 0:
+        return simple('no_area')
+
+    if pos == "внутри камеры профиля":
+        dist_ct = dist_user
+        if dist_ct > 0:
+            y_c = (n * area_r * dist_ct) / (area_b + n * area_r)
+            ix_tot = steiner(dist_ct, y_c)
+            if ay_main > 0 and ay_rein > 0:
+                y_min, y_max = min(-ay_main, dist_ct - ay_rein), max(h_b - ay_main, dist_ct + by_rein - ay_rein)
+            else:
+                y_min, y_max = min(-h_b / 2.0, dist_ct - by_rein / 2.0), max(h_b / 2.0, dist_ct + by_rein / 2.0)
+            c_max = fibers(y_min, y_max, y_c)
+            return finish(ix_tot, ix_tot / c_max if c_max > 0 else 0.0, 'inside_offset', True)
+        return simple('inside_coincident')
+
+    if pos in ("снаружи, улица", "снаружи, помещение"):
+        if by_rein <= 0:
+            by_rein = h_b if h_b > 0 else 1.0
+        if ay_main > 0 and ay_rein > 0:
+            dist_ct = (ay_main + ay_rein) if "помещен" in pos else ((h_b - ay_main) + ay_rein)
+            y_c = (n * area_r * dist_ct) / (area_b + n * area_r)
+            ix_tot = steiner(dist_ct, y_c)
+            y_min, y_max = min(-ay_main, dist_ct - ay_rein), max(h_b - ay_main, dist_ct + by_rein - ay_rein)
+            c_max = fibers(y_min, y_max, y_c)
+            return finish(ix_tot, ix_tot / c_max if c_max > 0 else 0.0, 'outside_ay', True)
+        # запасной вариант: геометрические центры
+        y_st = (h_b / 2.0 + by_rein / 2.0) if "помещен" in pos else -(h_b / 2.0 + by_rein / 2.0)
+        y_c = (n * area_r * y_st) / (area_b + n * area_r)
+        d_al, d_st = y_c / 10.0, (y_st - y_c) / 10.0
+        r.update(dist_ct=abs(y_st), y_c=y_c, d1=d_al, d2=d_st)
+        ix_tot = (ix_b + area_b * d_al ** 2) + n * (ix_r + area_r * d_st ** 2)
+        if "помещен" in pos:
+            y_min, y_max = -h_b / 2.0, h_b / 2.0 + by_rein
+        else:
+            y_min, y_max = -(h_b / 2.0 + by_rein), h_b / 2.0
+        c_front, c_back = abs(y_c - y_min) / 10.0, abs(y_max - y_c) / 10.0
+        r.update(y_min=y_min, y_max=y_max, c_top=c_back, c_bot=c_front, c_max=max(c_front, c_back))
+        c_max = max(c_front, c_back)
+        return finish(ix_tot, ix_tot / c_max if c_max > 0 else 0.0, 'outside_geom', True)
+
+    return simple('other_pos')
+
+
+# ---------------------------------------------------------------------------
+# Прогиб стойки и прогиб кромки стеклопакета (СТАТИКА: I39/I40, G45, E44).
+# Формулы 1:1 как в verify_selected_profiles (main.py); используются и при подборе профиля.
+# ---------------------------------------------------------------------------
+EDGE_DEFLECTION_LIMIT = 8.0   # мм; в СТАТИКЕ условие строгое: E44 < 8
+
+
+def mullion_edge_deflection(ix_cm4, h_m, q_norm, is_single_span, railing_enabled, b1, max_l,
+                            railing_norm_kn=0.8, e_module=70000.0):
+    """Прогиб стойки f_fact (мм, округлён до 0,1) и прогиб кромки стеклопакета f_edge (мм).
+    ix_cm4 - момент инерции стойки; q_norm - нормативная нагрузка на стойку, кН/м;
+    max_l - высота высокого стеклопакета max(L1, L2), мм.
+    Возвращает {'f_fact', 'f_edge', 'ok'}; f_edge = None, если расчёт кромки невозможен."""
+    if not ix_cm4 or ix_cm4 <= 0:
+        return {'f_fact': None, 'f_edge': None, 'ok': False}
+    if is_single_span:
+        f_wind = (5.0 * q_norm * ((h_m / 10.0) ** 4)) / (384.0 * e_module * ix_cm4)
+        f_rail = 0.0
+        if railing_enabled:
+            g14 = min(1400.0, h_m / 2.0)
+            f_rail = (railing_norm_kn * b1 * g14 * (3.0 * (h_m ** 2) - 4.0 * (g14 ** 2)) * 0.9) / (48.0 * e_module * 10000.0 * ix_cm4)
+        f_fact = round(f_wind + f_rail, 1)
+    else:
+        f_fact = round((1.0 / 185.0) * q_norm * ((h_m / 10.0) ** 4) / e_module / ix_cm4, 1)
+
+    f_arc = (h_m ** 2 + 4.0 * (f_fact ** 2)) / (8.0 * f_fact) if f_fact != 0 else 0.0
+    edge_term = 4.0 * (f_arc ** 2) - (max_l ** 2)
+    if edge_term >= 0 and f_arc > 0:
+        f_edge = round(f_arc - 0.5 * (edge_term ** 0.5), 1)
+        return {'f_fact': f_fact, 'f_edge': f_edge, 'ok': f_edge < EDGE_DEFLECTION_LIMIT}
+    # стрела прогиба слишком мала для заданной высоты стеклопакета - прогиб кромки пренебрежимо мал
+    return {'f_fact': f_fact, 'f_edge': None, 'ok': True}

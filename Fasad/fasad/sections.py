@@ -25,6 +25,7 @@ GLASS_LAYER = "MARK_СЕЧЕНИЕ_СТЕКЛО"
 CUT_LAYER = "MARK_РАЗРЕЗ"
 LEADER_LAYER = "MARK_ВЫНОСКИ"
 SETTING_LAYER = "MARK_ПОДКЛАДКИ"
+FACADE_SETTING_LAYER = "MARK_ФАСАД_ПОДКЛАДКИ"
 INSERT_LAYER_PREFIX = "MARK_ЗАКЛ_"
 
 _BAD_LAYER_CHARS = '<>/\\":;?*|,=`'          # запрещены в именах слоёв AutoCAD
@@ -54,6 +55,62 @@ class Item:
 def _label(block: str) -> str:
     """Подпись детали по имени блока: другая форма того же артикула - блок "Т50-04 (2)", подпись "Т50-04"."""
     return re.sub(r" \(\d+\)$", "", block)
+
+
+def _names_map(fac: Facade, system: System) -> dict[str, str]:
+    """Артикул -> расшифровка для легенды выносок ('КПС 344' -> 'ригель', 'КП45309' -> 'крышка ригеля')."""
+    out: dict[str, str] = {}
+    for p in fac.parts:
+        if p.article:
+            out.setdefault(_label(p.article), p.kind)
+    for r in system.profiles:
+        out.setdefault(_label(r["Шифр"]), r["Тип"])
+    kit_cols = {"Термовставка": "термовставка", "Прижим": "прижим",
+                "Крышка стойки": "крышка стойки", "Крышка ригеля": "крышка ригеля",
+                "Подкладка опорная": "подкладка опорная", "Подкладка фиксир.": "подкладка фиксирующая",
+                "Винт прижима": "винт прижима", "Винт под подкладку": "винт подкладки"}
+    for r in system.kits:
+        for col, nm in kit_cols.items():
+            for a, alt, _ in parse_items(str(r.get(col) or "")):
+                for x in (a, alt.strip()):
+                    if x:
+                        out.setdefault(_label(x), nm)
+    for key, nm in (("стойки", "уплотнитель стойки"), ("ригели", "уплотнитель ригеля"),
+                    ("прижим", "уплотнитель прижима")):
+        a = system.card.get("уплотнители", {}).get(key)
+        if a:
+            out.setdefault(_label(a), nm)
+    for r in system.perimeters:                     # в последнюю очередь: в наборе бывают уплотнители
+        for col in ("Крайняя стойка", "Крайний ригель"):
+            for a, alt, _ in parse_items(str(r.get(col) or "")):
+                for x in (a, alt.strip()):
+                    if x:
+                        out.setdefault(_label(x), "доборный по периметру")
+    return out
+
+
+class _Legend:
+    """Нумерованная расшифровка выносок сечения: на полке - номер, рядом столбик '1 — КПС 344 ригель'.
+    Один на витраж: номера общие для всех сечений (одна деталь - один номер)."""
+
+    def __init__(self, names: dict[str, str]):
+        self.names = names
+        self.num: dict[str, int] = {}
+
+    def no(self, text: str) -> int:
+        if text not in self.num:
+            self.num[text] = len(self.num) + 1
+        return self.num[text]
+
+    def items(self, x_left: float, y_top: float, h: float) -> list[Item]:
+        out = []
+        for text, n in sorted(self.num.items(), key=lambda kv: kv[1]):
+            desc = self.names.get(text, "")
+            desc = desc[:1].lower() + desc[1:] if desc else ""      # "Стойка" -> "стойка"
+            line = f"{n} — {text}" + (f" {desc}" if desc else "")
+            out.append(Item("text", LEADER_LAYER, x=x_left, y=y_top - (n - 1) * h * 1.8,
+                            h=h, text=line, align="left"))
+        return out
 
 
 def _rect(x0, y0, x1, y1):
@@ -104,20 +161,59 @@ def _glass_section(items, a0, a1, inner, outward, formula, horizontal, depth, ed
         pos += outward * t
 
 
-def _leaders(items, anchors: list[tuple[float, float, str]], col_x: float, top_y: float, h: float, left: bool):
-    """Выноски: от точки на детали - к подписи в столбик (без повторов)."""
-    seen, row = set(), 0
-    for ax, ay, text in sorted(anchors, key=lambda a: -a[1]):
-        if text in seen:
-            continue
-        seen.add(text)
-        ty = top_y - row * h * 1.8
-        row += 1
-        shelf = len(text) * h * 0.7
-        x_end = col_x - shelf if left else col_x + shelf
+def _leaders(items, anchors: list[tuple[float, float, str]], col_x: float, top_y: float, h: float,
+             left: bool, legend: _Legend):
+    """Ровный столбик номеров; порядок строк дополнительно распутывает наклонные линии."""
+    seen, rows = set(), []
+    for ax, ay, text in sorted(anchors, key=lambda a: (-a[1], a[0] if left else -a[0])):
+        if text not in seen:
+            seen.add(text)
+            rows.append((ax, ay, text))
+    shelf_y = [top_y - row * h * 1.6 for row in range(len(rows))]
+
+    def crossings(seq) -> int:
+        def orient(a, b, c):
+            return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+        total = 0
+        for i in range(len(seq)):
+            a, b = seq[i][:2], (col_x, shelf_y[i])
+            for j in range(i + 1, len(seq)):
+                c, d = seq[j][:2], (col_x, shelf_y[j])
+                if orient(a, b, c) * orient(a, b, d) < 0 and orient(c, d, a) * orient(c, d, b) < 0:
+                    total += 1
+        return total
+
+    starts = [rows, sorted(rows, key=lambda a: (-a[1], -a[0] if left else a[0])),
+              sorted(rows, key=lambda a: a[0]), sorted(rows, key=lambda a: -a[0])]
+    best_rows, best_n = rows, crossings(rows)
+    for start in starts:
+        candidate = start[:]
+        for _ in range(len(rows) * 2):
+            current, swap = crossings(candidate), None
+            for i in range(len(rows)):
+                for j in range(i + 1, len(rows)):
+                    trial = candidate[:]
+                    trial[i], trial[j] = trial[j], trial[i]
+                    n = crossings(trial)
+                    if n < current:
+                        current, swap = n, (i, j)
+            if swap is None:
+                break
+            i, j = swap
+            candidate[i], candidate[j] = candidate[j], candidate[i]
+        if crossings(candidate) < best_n:
+            best_rows, best_n = candidate, crossings(candidate)
+        if best_n == 0:
+            break
+    rows = best_rows
+
+    shelf = 2 * h * 0.7
+    x_end = col_x - shelf if left else col_x + shelf
+    for (ax, ay, text), ty in zip(rows, shelf_y):
+        num = str(legend.no(text))
         items.append(Item("poly", LEADER_LAYER, pts=[(ax, ay), (col_x, ty), (x_end, ty)], closed=False))
         items.append(Item("poly", LEADER_LAYER, pts=_rect(ax - h * 0.12, ay - h * 0.12, ax + h * 0.12, ay + h * 0.12)))
-        items.append(Item("text", LEADER_LAYER, x=min(col_x, x_end), y=ty + h * 0.35, h=h, text=text, align="left"))
+        items.append(Item("text", LEADER_LAYER, x=min(col_x, x_end), y=ty + h * 0.35, h=h, text=num, align="left"))
 
 
 def _cut_mark(items, x, y, view: tuple, stroke_dir: tuple, letter: str, f: dict):
@@ -139,7 +235,7 @@ def _cut_mark(items, x, y, view: tuple, stroke_dir: tuple, letter: str, f: dict)
     items.append(Item("poly", CUT_LAYER, pts=[tail, neck], width=f["хвост_ширина"] * M, closed=False))
     items.append(Item("poly", CUT_LAYER, pts=[neck, tip], closed=False,
                       widths=(f["наконечник_ширина"] * M, 0.0)))
-    hb = f["высота_буквы_разреза"] * M
+    hb = f.get("высота_обозначения", f["высота_буквы_разреза"] / 2) * M
     if vx == 0:      # взгляд по вертикали (Б-Б): буква сбоку от хвоста, наружу от витража
         cx, cy = tail[0] + sx * hb * 0.6, tail[1] + hb * 0.3
     else:            # взгляд по горизонтали (А-А): буква за хвостом
@@ -148,10 +244,12 @@ def _cut_mark(items, x, y, view: tuple, stroke_dir: tuple, letter: str, f: dict)
 
 
 def _leaders_by_layout(items, layout: list, bx: float, by: float, names: set, glass_name: str,
-                       setting_name: str, h: float, points: dict | None = None) -> set:
-    """Выноски по раскладке пользователя (смещения от точки вставки профиля узла).
-    Возвращает подписанные тексты; детали, которых нет в раскладке, подписываются отдельно."""
+                       setting_name: str, h: float, points: dict | None = None,
+                       legend: _Legend | None = None, fallback: tuple | None = None) -> set:
+    """Выноски по столбикам из раскладки; fallback - все точки и положение для деталей вне раскладки."""
     done = set()
+    groups = {}
+    legend = legend or _Legend({})
     for e in layout:
         text = e["текст"]
         if text.startswith(("Стеклопакет", "Заполнение")):
@@ -164,20 +262,26 @@ def _leaders_by_layout(items, layout: list, bx: float, by: float, names: set, gl
             continue
         done.add(text)
         a = (points or {}).get(text) or (bx + e["точка"][0], by + e["точка"][1])   # точка - на настоящей детали
-        k = (bx + e["перелом"][0], by + e["перелом"][1])
-        s_y = by + e["полка"][1]
-        if text == e["текст"]:
-            # тот же текст, что в образце - полка и надпись ровно как у пользователя
-            s_end = (bx + e["полка"][0], s_y)
-            tx, ty = bx + e["текст_в"][0], by + e["текст_в"][1]
+        to_left = e["полка"][0] < e["перелом"][0]
+        col_x = bx + e["перелом"][0] if text == glass_name else bx + layout[0]["перелом"][0]
+        top_y = by + e["полка"][1]
+        key = (to_left, col_x)
+        if key not in groups:
+            groups[key] = [top_y, []]
         else:
-            shelf = len(text) * h * 0.7
-            to_left = e["полка"][0] < e["перелом"][0]
-            s_end = (k[0] - shelf, s_y) if to_left else (k[0] + shelf, s_y)
-            tx, ty = min(k[0], s_end[0]), s_y + h * 0.35
-        items.append(Item("poly", LEADER_LAYER, pts=[a, (k[0], s_y), s_end], closed=False))
-        items.append(Item("poly", LEADER_LAYER, pts=_rect(a[0] - h * 0.12, a[1] - h * 0.12, a[0] + h * 0.12, a[1] + h * 0.12)))
-        items.append(Item("text", LEADER_LAYER, x=tx, y=ty, h=h, text=text, align="left"))
+            groups[key][0] = max(groups[key][0], top_y)
+        groups[key][1].append((a[0], a[1], text))
+    if fallback:
+        all_anchors, col_x, top_y, to_left = fallback
+        key = (to_left, col_x)
+        if key not in groups:
+            groups[key] = [top_y, []]
+        for ax, ay, text in all_anchors:
+            if text not in done:
+                groups[key][1].append((ax, ay, text))
+                done.add(text)
+    for (to_left, col_x), (top_y, anchors) in groups.items():
+        _leaders(items, anchors, col_x, top_y, h, left=to_left, legend=legend)
     return done
 
 
@@ -216,7 +320,9 @@ def _sections_library(fac: Facade, system: System, obj: ObjectParams, folder: Pa
     half = card["система"]["ширина_профиля"] / 2
     hl = f["высота_выноски"] * f.get("масштаб_сечений", M)
     hb = f["высота_буквы_разреза"] * M
+    hb_t = f.get("высота_обозначения", f["высота_буквы_разреза"] / 2) * M   # подпись "А-А" у сечения
     glass_name = f"Стеклопакет {obj.формула}" if obj.формула else f"Заполнение {obj.заполнение} мм"
+    legend = _Legend(_names_map(fac, system))       # номера выносок общие для всех сечений витража
 
     def put(node, base) -> list:
         """Вставить узел в системе base; вернуть точки выносок (середина детали, подпись)."""
@@ -239,7 +345,7 @@ def _sections_library(fac: Facade, system: System, obj: ObjectParams, folder: Pa
     floor = min(lo for lo, hi in fac.post_ends.values())
     y0 = floor - sc["отступ_сечения"] - 2 * hb
     left, right = fac.post_x[0], fac.post_x[-1]
-    leader_bb = []
+    y_top = max(hi for lo, hi in fac.post_ends.values())
 
     def post_art(px) -> str:
         """Профиль стойки для сечения: по детали марки (с учётом правок таблицы профилей)."""
@@ -247,51 +353,91 @@ def _sections_library(fac: Facade, system: System, obj: ObjectParams, folder: Pa
         p = next((p for p in fac.parts if p.where == f"S{n}" and p.kind == "Стойка"), None)
         return p.article if p else (obj.стойка or card["стойка"]["артикул"])
 
-    node_cache: dict = {}
-    mid = None
-    for px in fac.post_x:
-        edge = px in (left, right)
-        key = (edge, post_art(px))
-        if key not in node_cache:
-            node_cache[key] = src.node(beam=False, edge=edge, art=key[1])
-        node = node_cache[key]
-        mid = mid or node
-        vdir = (-1, 0) if edge and px == right else (1, 0)          # сторона стекла крайнего - внутрь витража
-        anchors = put(node, R._frame((px, y0), (0, -1), vdir))
-        if px == left:
-            leader_bb = anchors
-    g, inner = mid.g_lat, y0 - mid.g_in                 # наружу вниз: внутренняя грань стекла выше носика
-    first_bay = None
-    for xl, xr in zip(fac.post_x, fac.post_x[1:]):
-        if (xl, xr) in fac.floor_bays:
-            continue                                     # дверь до пола - стекла в сечении нет
-        first_bay = first_bay or (xl, xr)
-        _glass_section(items, xl + g, xr - g, inner, -1, obj.формула, True, sc["рамка_глубина"], sc["рамка_от_края"], obj.заполнение)
-    if first_bay:
-        leader_bb.append((first_bay[0] + 300, inner - obj.заполнение / 2, glass_name))
-    lay = layouts.get("Б-Б/стойка_край")
-    pts = {}
-    for x, y, n in leader_bb:
-        pts.setdefault(n, (x, y))
-    done = _leaders_by_layout(items, lay, left, y0, set(pts), glass_name, "", hl, pts) if lay else set()
-    rest = [a for a in leader_bb if a[2] not in done]
-    if rest:
-        _leaders(items, rest, left - 120, y0 - 120 if done else y0 + 150, hl, left=True)
-    items.append(Item("text", SECTION_LAYER, x=(left + right) / 2, y=y0 + 250, h=hb, text="Б-Б"))
+    def _bb(y0_pos: float, cut_y: float | None, letter: str, prefix: str,
+            x_range: tuple | None = None, mark_ends: tuple | None = None) -> None:
+        """Горизонтальное сечение по стойкам. y0_pos - носики стоек (где рисовать),
+        cut_y - высота засечки на фасаде (None - без засечки).
+        x_range - только стойки и ячейки в пределах линии (частичное сечение);
+        mark_ends - концы линии: засечки ставятся по ним (а не у крайних стоек)."""
+        lo, hi = (min(x_range), max(x_range)) if x_range is not None else (None, None)
+        pxs_show = [px for px in fac.post_x if lo is None or lo - 1 <= px <= hi + 1]
+        crossed = lo is None or any(max(a, lo) < min(b, hi) - 100
+                                    for a, b in zip(fac.post_x, fac.post_x[1:]))
+        if not pxs_show and not crossed:
+            warnings.append(f"Сечение {letter}: линия не пересекла ни одной стойки или ячейки - не построено")
+            return
+        x_lo, x_hi = (pxs_show[0], pxs_show[-1]) if pxs_show else (lo, hi)
+        leader_bb = []
+        node_cache: dict = {}
+        mid = None
+        for px in pxs_show:
+            edge = px in (fac.post_x[0], fac.post_x[-1])
+            key = (edge, post_art(px))
+            if key not in node_cache:
+                node_cache[key] = src.node(beam=False, edge=edge, art=key[1])
+            node = node_cache[key]
+            mid = mid or node
+            vdir = (-1, 0) if edge and px == x_hi else (1, 0)          # сторона стекла крайнего - внутрь сечения
+            anchors = put(node, R._frame((px, y0_pos), (0, -1), vdir))
+            if px == x_lo:
+                leader_bb = anchors
+        if mid is None:                             # линия прошла только сквозь стекло
+            mid = src.node(beam=False, edge=False, art=obj.стойка or card["стойка"]["артикул"])
+        g, inner = mid.g_lat, y0_pos - mid.g_in                 # наружу вниз: внутренняя грань стекла выше носика
+        first_bay = None
+        for xl, xr in zip(fac.post_x, fac.post_x[1:]):
+            if (xl, xr) in fac.floor_bays:
+                continue                                     # дверь до пола - стекла в сечении нет
+            if lo is not None:
+                xl, xr = max(xl, lo), min(xr, hi)
+                if xr - xl < 100:
+                    continue
+            first_bay = first_bay or (xl, xr)
+            _glass_section(items, xl + g, xr - g, inner, -1, obj.формула, True, sc["рамка_глубина"], sc["рамка_от_края"], obj.заполнение)
+        if first_bay:
+            leader_bb.append(((first_bay[0] + first_bay[1]) / 2, inner - obj.заполнение / 2, glass_name))
+        lay = layouts.get(f"{prefix}/стойка_край")
+        pts = {}
+        for x, y, n in leader_bb:
+            pts.setdefault(n, (x, y))
+        if lay:
+            _leaders_by_layout(items, lay, x_lo, y0_pos, set(pts), glass_name, "", hl, pts,
+                               legend=legend, fallback=(leader_bb, x_lo - 120, y0_pos - 120, True))
+        elif leader_bb:
+            _leaders(items, leader_bb, x_lo - 120, y0_pos + 150, hl, left=True, legend=legend)
+        items.append(Item("text", SECTION_LAYER, x=(x_lo + x_hi) / 2, y=y0_pos + 250, h=hb_t,
+                          text=f"{letter}-{letter}"))
+        if cut_y is not None:
+            if mark_ends is not None:               # по концам линии пользователя
+                _cut_mark(items, mark_ends[0], cut_y, (0, 1), (-1, 0), letter, f)
+                _cut_mark(items, mark_ends[1], cut_y, (0, 1), (1, 0), letter, f)
+            else:
+                _cut_mark(items, x_lo - half - 100, cut_y, (0, 1), (-1, 0), letter, f)
+                _cut_mark(items, x_hi + half + 100, cut_y, (0, 1), (1, 0), letter, f)
+
     rows = sorted({gl.y0 for gl in fac.glasses})
     if rows:
         low = [gl for gl in fac.glasses if abs(gl.y0 - rows[0]) < TOL]
-        cut_y = (rows[0] + min(gl.y1 for gl in low)) / 2
-        _cut_mark(items, left - half - 100, cut_y, (0, 1), (-1, 0), "Б", f)
-        _cut_mark(items, right + half + 100, cut_y, (0, 1), (1, 0), "Б", f)
+        _bb(y0, (rows[0] + min(gl.y1 for gl in low)) / 2, "Б", "Б-Б")
+    else:
+        _bb(y0, None, "Б", "Б-Б")
 
-    # ---------- А-А: вертикальное сечение по первому пролёту без двери, наружу = вправо ----------
-    bay = next(((xl, xr) for xl, xr in zip(fac.post_x, fac.post_x[1:]) if (xl, xr) not in fac.floor_bays), None)
-    if bay:
-        x0 = right + half + sc["отступ_сечения"] + 2 * hb              # как раньше - от неё раскладка выносок
+    # ---------- А-А: вертикальное сечение по пролёту, наружу = вправо ----------
+    def _aa(bay, x0_pos: float, letter: str, prefix: str, y_range: tuple | None = None,
+            mark_x: float | None = None) -> None:
+        """Вертикальное сечение через пролёт bay. x0_pos - ось выносок (как у А-А).
+        y_range - частичное сечение: узлы - ригели в линии, стекло - обрезано по линии.
+        mark_x - где на фасаде ставить засечки (по умолчанию - центр пролёта)."""
         rn = _riegel_nose(folder / sc["блоки"], card["ригель"]["артикул"])
-        nose_x = x0 - rn
+        nose_x = x0_pos - rn
         ys = sorted(fac.bays.get(bay, []))
+        lo, hi = (min(y_range), max(y_range)) if y_range is not None else (None, None)
+        ys_show = [y for y in ys if lo is None or lo - 1 <= y <= hi + 1]
+        crossed = lo is None or any(max(a, lo) < min(b, hi) - 100
+                                    for a, b in zip(ys, ys[1:]))
+        if not ys_show and not crossed:
+            warnings.append(f"Сечение {letter}: линия не пересекла пролёт - не построено")
+            return
         groups: dict[float, tuple] = {}
 
         def b_art(y) -> str:
@@ -309,21 +455,27 @@ def _sections_library(fac: Facade, system: System, obj: ObjectParams, folder: Pa
                 fix_wt[(round(float(y_s[1:])), ia, ib)] = wt
             except (ValueError, IndexError):
                 continue
-        light_variant = card.get("подкладки_по_весу", {}).get(obj.вариант)
+        def _tint(v):
+            try:
+                return int(float(str(v).replace(",", ".")))
+            except ValueError:
+                return None
+        heavy_variant = next((str(r.get("Вариант")) for r in system.kits
+                              if _tint(r.get("Толщина")) == obj.заполнение
+                              and str(r.get("Вариант", "")).startswith("Тяжелые")), None)
 
         def b_variant(y):
-            if not light_variant:
-                return None
+            # под тяжёлым пакетом - тяжёлый узел (вариант витража обычный), иначе - вариант витража
             try:
                 ia, ib = fac.post_x.index(bay[0]) + 1, fac.post_x.index(bay[1]) + 1
                 wt = fix_wt.get((round(y), ia, ib), 0.0)
             except ValueError:
                 wt = 0.0
-            return None if _pad_heavy(wt, card) else light_variant
+            return heavy_variant if (_pad_heavy(wt, card) and heavy_variant) else None
 
         bnode_cache: dict = {}
         mid_b = None
-        for y in ys:
+        for y in ys_show:
             if abs(y - fac.bottom_y) < TOL:
                 key, vdir = "ригель_край", (0, 1)
                 gb = (True, False)
@@ -340,28 +492,80 @@ def _sections_library(fac: Facade, system: System, obj: ObjectParams, folder: Pa
             node = bnode_cache[ck]
             mid_b = mid_b or node
             anchors = put(node, R._frame((nose_x, y), (1, 0), vdir))
-            if y == ys[0] or (len(ys) > 2 and y == ys[1]):
-                groups[y] = (f"А-А/{key}", anchors)
+            if y == ys_show[0] or (len(ys_show) > 2 and y == ys_show[1]):
+                groups[y] = (f"А-А/{key}", anchors)   # у всех вертикальных сечений одна раскладка выносок
+        if mid_b is None:                       # линия прошла только сквозь стекло
+            mid_b = src.node(beam=True, edge=False, art=obj.ригель or card["ригель"]["артикул"])
         inner = nose_x + mid_b.g_in
-        g = mid_b.g_lat
-        for yb, yt in zip(ys, ys[1:]):
-            _glass_section(items, yb + g, yt - g, inner, +1, obj.формула, False, sc["рамка_глубина"], sc["рамка_от_края"], obj.заполнение)
-        if len(ys) > 1 and ys[0] in groups:
-            groups[ys[0]][1].append((inner + obj.заполнение / 2, ys[0] + 300, glass_name))
-        for y, (lay_key, anchors) in groups.items():
-            lay = layouts.get(lay_key)
+        glass_y = None
+        for gl in fac.glasses:
+            if not bay[0] - TOL <= (gl.x0 + gl.x1) / 2 <= bay[1] + TOL:
+                continue
+            yb, yt = gl.y0, gl.y1
+            if lo is not None:
+                yb, yt = max(yb, lo), min(yt, hi)
+                if yt - yb < 1:
+                    continue
+            _glass_section(items, yb, yt, inner, +1, obj.формула, False,
+                           sc["рамка_глубина"], sc["рамка_от_края"], obj.заполнение)
+            if glass_y is None or yb < glass_y:
+                glass_y = (yb + yt) / 2
+        if glass_y is not None:
+            if not groups:
+                groups[glass_y] = ("А-А/ригель_середина", [])
+            groups[min(groups)][1].append((inner + obj.заполнение / 2, glass_y, glass_name))
+        with_layout = [(y, layouts[lay_key], anchors) for y, (lay_key, anchors) in groups.items()
+                       if lay_key in layouts]
+        loose = [a for y, (lay_key, anchors) in groups.items() if lay_key not in layouts for a in anchors]
+        for index, (y, lay, anchors) in enumerate(with_layout):
             pts = {}
             for ax, ay, n in anchors:
                 pts.setdefault(n, (ax, ay))
-            done = _leaders_by_layout(items, lay, x0, y, set(pts), glass_name, "", hl, pts) if lay else set()
-            rest = [a for a in anchors if a[2] not in done]
-            if rest:
-                _leaders(items, rest, x0 + 160, y - 120 if done else y + 7 * hl, hl, left=False)
-        items.append(Item("text", SECTION_LAYER, x=x0 + 30, y=max(ys) + 250, h=hb, text="А-А"))
-        cx = (bay[0] + bay[1]) / 2
-        y_top = max(hi for lo, hi in fac.post_ends.values())
-        _cut_mark(items, cx, y_top + 100, (1, 0), (0, 1), "А", f)
-        _cut_mark(items, cx, floor - 100, (1, 0), (0, -1), "А", f)
+            all_anchors = anchors + (loose if index == 0 else [])
+            _leaders_by_layout(items, lay, x0_pos, y, set(pts), glass_name, "", hl, pts,
+                               legend=legend, fallback=(all_anchors, x0_pos + 160, y - 120, False))
+        if not with_layout and loose:
+            _leaders(items, loose, x0_pos + 160, max(groups) + 7 * hl, hl, left=False, legend=legend)
+        y_title = max(ys_show) if ys_show else hi
+        items.append(Item("text", SECTION_LAYER, x=x0_pos + 30, y=y_title + 250, h=hb_t,
+                          text=f"{letter}-{letter}"))
+        cx = (bay[0] + bay[1]) / 2 if mark_x is None else mark_x
+        if y_range is not None:                     # по концам линии пользователя
+            _cut_mark(items, cx, y_range[1], (1, 0), (0, 1), letter, f)
+            _cut_mark(items, cx, y_range[0], (1, 0), (0, -1), letter, f)
+        else:
+            _cut_mark(items, cx, y_top + 100, (1, 0), (0, 1), letter, f)
+            _cut_mark(items, cx, floor - 100, (1, 0), (0, -1), letter, f)
+
+    bay = next(((xl, xr) for xl, xr in zip(fac.post_x, fac.post_x[1:]) if (xl, xr) not in fac.floor_bays), None)
+    if bay:
+        _aa(bay, right + half + sc["отступ_сечения"] + 2 * hb, "А", "А-А")
+
+    # ---------- добавленные сечения: линии команды ДОБАВИТЬСЕЧЕНИЕ (хранятся в чертеже) ----------
+    LETTERS = "АБВГДЕЖЗИКЛМНОПРСТУФХЦЧШЩЭЮЯ"      # без Ё, Й, Ъ, Ь, Ы
+    step = sc.get("шаг_доп_сечений", 1000)          # шаг размещения В-В, Г-Г… (в карточке можно менять)
+    v_i, h_i = 0, 0
+    for k, (x1, y1, x2, y2) in enumerate(fac.extra_sections):
+        letter = LETTERS[2 + k] if 2 + k < len(LETTERS) else "?"
+        if abs(x2 - x1) < abs(y2 - y1):                # вертикальная линия -> вертикальное сечение пролёта
+            xc = (x1 + x2) / 2
+            bays = [(xl, xr) for xl, xr in zip(fac.post_x, fac.post_x[1:])
+                    if xl - 1 <= xc <= xr + 1 and (xl, xr) not in fac.floor_bays]
+            if not bays:
+                warnings.append(f"Сечение {letter}-{letter}: линия не попала в пролёт без двери - пропуск")
+                continue
+            # ближайший к линии пролёт; линия точно на стойке - правый пролёт
+            bays.sort(key=lambda b: (abs((b[0] + b[1]) / 2 - xc), -b[0]))
+            v_i += 1
+            _aa(bays[0], right + half + sc["отступ_сечения"] + 2 * hb + v_i * step, letter, letter,
+                y_range=(min(y1, y2), max(y1, y2)),
+                mark_x=min(max(xc, left), right))
+        else:                                          # горизонтальная -> сечение по стойкам на высоте линии
+            yc = (y1 + y2) / 2
+            h_i += 1
+            _bb(y0 - h_i * step, yc if fac.glasses else None, letter, letter,
+                x_range=(min(x1, x2), max(x1, x2)), mark_ends=(min(x1, x2), max(x1, x2)))
+    items += legend.items(left - 40 * hl, y0 + 16 * hl, hl)     # легенда - слева от первого сечения Б-Б
     return items, warnings
 
 
@@ -417,6 +621,7 @@ def _sections_catalog(fac: Facade, system: System, obj: ObjectParams, folder: Pa
     pk = card["подкладки"]
     setting = parse_items(fac.kit.get("Подкладка опорная", ""))
     setting_name = fac.kit.get("Подкладка опорная", "")
+    legend = _Legend(_names_map(fac, system))       # номера выносок общие для всех сечений витража
     setting_shape = (shapes.get(f"{setting[0][0]}/{card['ригель']['артикул']}/сечение", {}).get("точки")
                      if setting else None)
 
@@ -447,11 +652,11 @@ def _sections_catalog(fac: Facade, system: System, obj: ObjectParams, folder: Pa
     if first_bay:
         leader_bb.append((first_bay[0] + 300, inner - obj.заполнение / 2, glass_name))
     lay = layouts.get("Б-Б/стойка_край")
-    done = (_leaders_by_layout(items, lay, bb_base.x, bb_base.y, {n for _, _, n in leader_bb}, glass_name, "", hl)
-            if lay and bb_base else set())
-    rest = [a for a in leader_bb if a[2] not in done]
-    if rest:
-        _leaders(items, rest, left - 120, y0 - 120 if done else y0 + 150, hl, left=True)
+    if lay and bb_base:
+        _leaders_by_layout(items, lay, bb_base.x, bb_base.y, {n for _, _, n in leader_bb}, glass_name, "", hl,
+                           legend=legend, fallback=(leader_bb, left - 120, y0 - 120, True))
+    elif leader_bb:
+        _leaders(items, leader_bb, left - 120, y0 + 150, hl, left=True, legend=legend)
     items.append(Item("text", SECTION_LAYER, x=(left + right) / 2, y=y0 + 250, h=hb, text="Б-Б"))
 
     # Б-Б на фасаде: середина нижнего ряда стёкол ПО ВСЕМ пролётам (разрез проходит через стекло
@@ -507,19 +712,23 @@ def _sections_catalog(fac: Facade, system: System, obj: ObjectParams, folder: Pa
                 groups[yb][2].append((inner + pk["ширина_в_сечении"] / 2, yb + g - 2, setting_name))
         if len(ys) > 1 and ys[0] in groups:
             groups[ys[0]][2].append((inner + obj.заполнение / 2, ys[0] + 300, glass_name))
-        for y, (lay_key, nb, anchors) in groups.items():
-            lay = layouts.get(lay_key)
-            done = (_leaders_by_layout(items, lay, nb.x, nb.y, {n for _, _, n in anchors}, glass_name, setting_name, hl)
-                    if lay else set())
-            rest = [a for a in anchors if a[2] not in done]
-            if rest:
-                _leaders(items, rest, x0 + 160, y - 120 if done else y + 7 * hl, hl, left=False)
+        with_layout = [(y, nb, layouts[lay_key], anchors) for y, (lay_key, nb, anchors) in groups.items()
+                       if lay_key in layouts]
+        loose = [a for y, (lay_key, nb, anchors) in groups.items() if lay_key not in layouts for a in anchors]
+        for index, (y, nb, lay, anchors) in enumerate(with_layout):
+            all_anchors = anchors + (loose if index == 0 else [])
+            _leaders_by_layout(items, lay, nb.x, nb.y, {n for _, _, n in anchors}, glass_name,
+                               setting_name, hl, legend=legend,
+                               fallback=(all_anchors, x0 + 160, y - 120, False))
+        if not with_layout and loose:
+            _leaders(items, loose, x0 + 160, max(groups) + 7 * hl, hl, left=False, legend=legend)
         items.append(Item("text", SECTION_LAYER, x=x0 + 30, y=max(ys) + 250, h=hb, text="А-А"))
         # А-А на фасаде: посередине пролёта, взгляд вправо (по образцу пользователя)
         cx = (bay[0] + bay[1]) / 2
         y_top = max(hi for lo, hi in fac.post_ends.values())
         _cut_mark(items, cx, y_top + 100, (1, 0), (0, 1), "А", f)
         _cut_mark(items, cx, floor - 100, (1, 0), (0, -1), "А", f)
+    items += legend.items(left - 40 * hl, y0 + 16 * hl, hl)       # легенда - слева от сечения Б-Б
     return items, warnings, used_blocks
 
 
@@ -599,11 +808,11 @@ def build_on_facade(fac: Facade, system: System, obj: ObjectParams, folder: Path
     for gl in fac.glasses:
         xl, xr = gl.x0 - card["стекло"]["от_оси"] + half, gl.x1 + card["стекло"]["от_оси"] - half   # грани стоек
         for a in (xl + pk["от_стойки"], xr - pk["от_стойки"] - pk["длина"]):
-            items.append(Item("poly", SETTING_LAYER, pts=_rect(a, gl.y0 - t, a + pk["длина"], gl.y0)))
+            items.append(Item("poly", FACADE_SETTING_LAYER, pts=_rect(a, gl.y0 - t, a + pk["длина"], gl.y0)))
         if has_fix:
             for x_edge, d in ((gl.x0, -1), (gl.x1, 1)):
                 b0 = gl.y0 + pk["от_стойки"]
-                items.append(Item("poly", SETTING_LAYER,
+                items.append(Item("poly", FACADE_SETTING_LAYER,
                                   pts=_rect(min(x_edge, x_edge + d * t), b0, max(x_edge, x_edge + d * t), b0 + pk["длина"])))
     return items
 
@@ -616,4 +825,5 @@ def layer_color(layer: str, card: dict) -> int:
             if code.endswith(suf):
                 return zc[key]
         return 4
-    return {SECTION_LAYER: 7, GLASS_LAYER: 5, CUT_LAYER: 7, LEADER_LAYER: 8, SETTING_LAYER: 30}.get(layer, 7)
+    return {SECTION_LAYER: 7, GLASS_LAYER: 5, CUT_LAYER: 7, LEADER_LAYER: 8,
+            SETTING_LAYER: 30, FACADE_SETTING_LAYER: 30}.get(layer, 7)

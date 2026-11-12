@@ -15,7 +15,7 @@ from .facade import formula_layers
 from .lora_link import (beams_with_fixing, fixing_holes, fixing_warning_text, heavy_thickness_hint,
                         norm_art, to_float, wrap_beams_fixing, wrap_kits, wrap_profiles)
 
-FONT = ("Arial", 14)
+FONT = ("Segoe UI", 10)
 NOT_COPIED = ("ИМЯ", "КОЛИЧЕСТВО")       # при "применить ко всем" не копируются
 SEP = "  —  "                            # "значение  —  расшифровка" в списках
 
@@ -54,8 +54,8 @@ def confirm_project_overwrite(name: str) -> bool:
         root.destroy()
 
 
-def ask(vitrages: list[dict], top: dict, choices: dict, kit_ok=None, statics=None, statics_geom=None
-       ) -> tuple[list[dict], dict] | None:
+def ask(vitrages: list[dict], top: dict, choices: dict, kit_ok=None, statics=None, statics_geom=None,
+          fresh: bool = False) -> tuple[list[dict], dict] | None:
     """vitrages: [{"подпись": "X 0..3600", "атрибуты": {ТЕГ: значение}}]; top: {"объект", "система"}.
     choices: ТЕГ -> список значений, или функция(толщина) -> [(значение, расшифровка)] (варианты по толщине);
     "системы" - список систем. kit_ok(заполнение, вариант) -> текст ошибки или "".
@@ -77,10 +77,13 @@ def ask(vitrages: list[dict], top: dict, choices: dict, kit_ok=None, statics=Non
     sys_combo = ttk.Combobox(frm_top, textvariable=v_sys, values=choices.get("системы", []), width=14,
                              state="readonly")
     sys_combo.grid(row=0, column=3, sticky="w", padx=8)
+    ttk.Label(frm_top, text="Угол наклона, градусов").grid(row=0, column=4, sticky="w", padx=(20, 0))
+    v_ang = tk.StringVar(value="90")
+    ttk.Entry(frm_top, textvariable=v_ang, width=6).grid(row=0, column=5, sticky="w", padx=8)
 
     # ---------- статика (Lora) ----------
     if statics is not None:
-        v_stat = tk.BooleanVar(value=False)
+        v_stat = tk.BooleanVar(value=True)
         chk_stat = ttk.Checkbutton(frm_top, text="Считать статику", variable=v_stat)
         chk_stat.grid(row=1, column=0, sticky="w", pady=(10, 0))
         btn_stat = ttk.Button(frm_top, text="Расчёт нагрузок", state="disabled",
@@ -114,6 +117,7 @@ def ask(vitrages: list[dict], top: dict, choices: dict, kit_ok=None, statics=Non
             w = ttk.Entry(frm, textvariable=var, width=18)
         w.grid(row=row, column=col + 1, sticky="w", pady=3)
         vars_[tag] = var
+    formula_w = None
     for k, tag in enumerate(wide):
         label = next(a[1] for a in ATTRS if a[0] == tag)
         ttk.Label(frm, text=label).grid(row=half + k, column=0, sticky="w", pady=(10 if k == 0 else 3, 3))
@@ -123,6 +127,8 @@ def ask(vitrages: list[dict], top: dict, choices: dict, kit_ok=None, statics=Non
             combos[tag] = w
         else:
             w = ttk.Entry(frm, textvariable=vars_[tag], width=80)
+            if tag == "ФОРМУЛА":
+                formula_w = w                # поле формулы - всегда доступно (оно разблокирует остальное)
         w.grid(row=half + k, column=1, columnspan=3, sticky="ew", pady=(10 if k == 0 else 3, 3))
     current = {"i": None}
 
@@ -197,6 +203,26 @@ def ask(vitrages: list[dict], top: dict, choices: dict, kit_ok=None, statics=Non
         dup = sorted({n for n in names if names.count(n) > 1})
         if dup:
             errs.append("Марки повторяются: " + ", ".join(dup))
+        res_st = last_stat["res"]
+        wt = to_float((res_st or {}).get("вес_стекла_кг"))
+        if wt and statics is not None:
+            rules = sorted(statics.system.card["крепление_ригеля"], key=lambda r: r["до_кг"])
+            light_max = max((r["до_кг"] for r in rules if not r.get("тяжелый")), default=0)
+            if wt > light_max:
+                def _tint(v):
+                    try:
+                        return int(float(str(v).replace(",", ".")))
+                    except ValueError:
+                        return None
+                for d in data:
+                    t = _tint(d.get("ЗАПОЛНЕНИЕ", ""))
+                    has_heavy = any(_tint(r.get("Толщина")) == t and str(r.get("Вариант", "")).startswith("Тяжелые")
+                                    for r in statics.system.kits)
+                    if t and not has_heavy:
+                        errs.append(f"{d.get('ИМЯ', '?')}: стекло {wt:g} кг - для толщины {t} мм подкладки "
+                                    f"КПС 846/1126 не предусмотрены, измените толщину пакета "
+                                    f"(40-48 мм - КПС 846, 52-58 мм - КПС 1126)")
+                        break
         if not v_obj.get().strip():
             errs.append("Не задано название объекта")
         if errs:
@@ -215,13 +241,14 @@ def ask(vitrages: list[dict], top: dict, choices: dict, kit_ok=None, statics=Non
     if statics is not None:
         applying = {"on": False}
         note_fix = {"text": ""}
+        last_stat = {"res": None}
 
         def set_locked(on: bool):
             """Галка 'Считать статику': активны только название объекта и чекбокс с кнопкой."""
             state = "disabled" if on else "normal"
             for w in frm.winfo_children():
                 if isinstance(w, (ttk.Entry, ttk.Combobox)):
-                    w.configure(state=state)
+                    w.configure(state="normal" if w is formula_w else state)
             for cb in combos.values():
                 cb.configure(state="disabled" if on else "readonly")
             lb.configure(state=state)
@@ -259,23 +286,23 @@ def ask(vitrages: list[dict], top: dict, choices: dict, kit_ok=None, statics=Non
         def apply_statics(res):
             """Фильтры по результату Лоры: стойки/ригели не уже выбранных, варианты по весу стекла,
             ригели - только с закладной под требуемые отверстия (Лора смотрит только прочность)."""
+            last_stat["res"] = res
             note_fix["text"] = ""
             st, rg = res.get("стойка") or {}, res.get("ригель") or {}
             if (d := to_float(st.get("глубина"))):
                 choices["СТОЙКА"] = wrap_profiles(orig_choices["СТОЙКА"], d, statics)
             if (d := to_float(rg.get("глубина"))):
                 choices["РИГЕЛЬ"] = wrap_profiles(orig_choices["РИГЕЛЬ"], d, statics)
-            if (wt := to_float(res.get("вес_стекла_кг"))):
-                choices["ВАРИАНТ"] = wrap_kits(orig_choices["ВАРИАНТ"], statics, wt)
-                holes = fixing_holes(statics, wt)
-                allowed = beams_with_fixing(statics.system, holes) if holes else set()
-                all_beams = orig_choices["РИГЕЛЬ"]("0")
-                if allowed and any(norm_art(v) not in allowed for v, _ in all_beams):
-                    choices["РИГЕЛЬ"] = wrap_beams_fixing(choices["РИГЕЛЬ"], allowed)
-                    rg_art = rg.get("артикул")
-                    if rg_art and norm_art(rg_art) not in allowed:
-                        note_fix["text"] = (f"Ригель {rg_art} из Лоры не применён: нет закладной "
-                                            f"с отверстиями \"{holes}\" (стекло {wt:g} кг)")
+            wt = to_float(res.get("вес_стекла_кг")) or 0.0
+            holes = fixing_holes(statics, wt)
+            allowed = beams_with_fixing(statics.system, holes) if holes else set()
+            all_beams = orig_choices["РИГЕЛЬ"]("0")
+            if allowed and any(norm_art(v) not in allowed for v, _ in all_beams):
+                choices["РИГЕЛЬ"] = wrap_beams_fixing(choices["РИГЕЛЬ"], allowed)
+                rg_art = rg.get("артикул")
+                if rg_art and norm_art(rg_art) not in allowed:
+                    note_fix["text"] = (f"Ригель {rg_art} из Лоры не применён: нет закладной "
+                                        f"с отверстиями \"{holes}\" (стекло {wt:g} кг)")
             refresh_options()
             for tag, p in (("СТОЙКА", st), ("РИГЕЛЬ", rg)):
                 art = p.get("артикул")
@@ -308,29 +335,29 @@ def ask(vitrages: list[dict], top: dict, choices: dict, kit_ok=None, statics=Non
             i = current["i"]
             g = statics_geom[i] if statics_geom is not None and i is not None and i < len(statics_geom) else None
             try:
-                res = statics.run(v_obj.get().strip(), glass_mm(), g)
+                ang = to_float(v_ang.get()) or 90.0
+                res = statics.run(v_obj.get().strip(), glass_mm(), g, ang)
             except RuntimeError as e:
                 messagebox.showerror("Статика", str(e), parent=root)
                 return
-            applying["on"] = True
-            try:
-                v_stat.set(False)               # галка снимается - окно снова активно
-            finally:
-                applying["on"] = False
-            set_locked(False)                   # трейс подавлен выше - разблокируем явно
             if res is None:
+                set_locked(True)
+                btn_stat.configure(state="normal")
                 messagebox.showwarning("Статика", "Результат не получен:\n"
                                       "в Лоре не выполнен расчёт или окно закрыто без экспорта.",
                                        parent=root)
                 return
+            applying["on"] = True
+            try:
+                v_stat.set(False)               # результат получен - галка снимается, окно активно
+            finally:
+                applying["on"] = False
+            set_locked(False)
             apply_statics(res)
             messagebox.showinfo("Статика", statics_label(res) or "Результат принят.", parent=root)
             msg_fix = fixing_warning_text(statics, res)
             if msg_fix:
                 messagebox.showwarning("Статика - крепление ригеля", msg_fix, parent=root)
-            hint = heavy_thickness_hint(statics, vars_["ЗАПОЛНЕНИЕ"].get(), res.get("вес_стекла_кг"))
-            if hint:
-                messagebox.showwarning("Статика - толщина пакета", hint, parent=root)
 
         def on_stat_toggle(*_):
             if applying["on"]:
@@ -341,9 +368,36 @@ def ask(vitrages: list[dict], top: dict, choices: dict, kit_ok=None, statics=Non
                 restore_choices()
 
         v_stat.trace_add("write", on_stat_toggle)
-        saved_res = statics.read()               # проект уже считался - фильтры сразу
+        set_locked(bool(v_stat.get()))           # сразу применить состояние галки при открытии
+        saved_res = None if fresh else statics.read()   # свежий чертёж - прошлые фильтры не восстанавливаем
         if saved_res:
             apply_statics(saved_res)
+            applying["on"] = True
+            try:
+                v_stat.set(False)
+            finally:
+                applying["on"] = False
+
+        def on_formula(*_):
+            # До расчёта формула активирует только кнопку; остальное - после результата Лоры.
+            f = vars_["ФОРМУЛА"].get().strip()
+            if not f:
+                return
+            try:
+                total = sum(tt for _, tt, _ in formula_layers(f))
+            except ValueError:
+                return
+            vars_["ЗАПОЛНЕНИЕ"].set(f"{total:g}")
+            if last_stat["res"] is None:
+                set_locked(True)
+                btn_stat.configure(state="normal")
+            else:
+                set_locked(False)
+
+        vars_["ФОРМУЛА"].trace_add("write", on_formula)
+        set_locked(True)                         # до формулы активны название, угол и формула
+        btn_stat.configure(state="disabled")
+        on_formula()                             # сохранённый результат Лоры разблокирует старый проект
 
     root.update_idletasks()
     avail_h = root.winfo_screenheight() - 100               # заголовок + панель задач

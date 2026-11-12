@@ -1409,6 +1409,32 @@ class NewProfileDialog(QtWidgets.QDialog):
 
         self._calculate_all()
 
+    def _rein_eff(self, kind):
+        """Характеристики усилителя так, как их использует расчёт итоговых характеристик
+        (ввод характеристиками или расчёт по геометрии). kind: 'm' - стойка, 't' - ригель."""
+        if kind == 'm':
+            char, geom = self.checkBox_2.isChecked(), self.checkBox_5.isChecked()
+            c = dict(ix=self.lineEdit_9, iy=self.lineEdit_10, area=self.lineEdit_13,
+                     bx=self.lineEdit_55, by=self.lineEdit_59)
+            g = dict(ix=self.lineEdit_37, iy=self.lineEdit_38, wx=self.lineEdit_39, wy=self.lineEdit_40,
+                     area=self.lineEdit_41, bx=self.lineEdit_15, by=self.lineEdit_16, t=self.lineEdit_17,
+                     shape=self.comboBox_8)
+        else:
+            char, geom = self.checkBox_3.isChecked(), self.checkBox_6.isChecked()
+            c = dict(ix=self.lineEdit_18, iy=self.lineEdit_19, area=self.lineEdit_23,
+                     bx=self.lineEdit_56, by=self.lineEdit_60)
+            g = dict(ix=self.lineEdit_51, iy=self.lineEdit_47, wx=self.lineEdit_48, wy=self.lineEdit_49,
+                     area=self.lineEdit_50, bx=self.lineEdit_27, by=self.lineEdit_28, t=self.lineEdit_29,
+                     shape=self.comboBox_9)
+        if char:
+            return {'mode': 'char', **{k: self._parse_float(w.text()) for k, w in c.items()}}
+        if geom:
+            d = {k: self._parse_float(w.text()) for k, w in g.items() if k != 'shape'}
+            d['shape'] = g['shape'].currentText()
+            d['mode'] = 'geom'
+            return d
+        return {'mode': 'none'}
+
     def get_result(self):
         m_rein_active = self.checkBox_2.isChecked() or self.checkBox_5.isChecked()
         t_rein_active = self.checkBox_3.isChecked() or self.checkBox_6.isChecked()
@@ -1503,6 +1529,10 @@ class NewProfileDialog(QtWidgets.QDialog):
                 'rein_bx_char': self._parse_float(self.lineEdit_59.text()),
                 'by_m': self._parse_float(self.lineEdit_7.text()),
                 'bx_m': self._parse_float(self.lineEdit_57.text()),
+                'ayay': self._parse_float(self.lineEdit_ayay_st.text()),
+                'ax_main': self._parse_float(self.lineEdit_ax_main_2.text()),
+                'ax_rein': self._parse_float(self.lineEdit_ax_rein_2.text()),
+                'rein_eff': self._rein_eff('m'),
             },
             'transom': {
                 'art': self.lineEdit_30.text(),
@@ -1539,5 +1569,10 @@ class NewProfileDialog(QtWidgets.QDialog):
                 'rein_bx_char': self._parse_float(self.lineEdit_60.text()),
                 'by_t': self._parse_float(self.lineEdit_36.text()),
                 'bx_t': self._parse_float(self.lineEdit_58.text()),
+                'sys_type': self.comboBox_sys.currentIndex(),
+                'ayay': self._parse_float(self.lineEdit_ayay_rig.text()),
+                'ax_main': self._parse_float(self.lineEdit_ax_main_3.text()),
+                'ax_rein': self._parse_float(self.lineEdit_ax_rein_3.text()),
+                'rein_eff': self._rein_eff('t'),
             }
         }

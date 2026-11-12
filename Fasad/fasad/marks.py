@@ -15,7 +15,7 @@ BEAM_MARK_LAYER = "MARK_R"
 
 
 def beam_marks(fac: Facade, system: System) -> list[tuple[float, float, float, str]]:
-    """Марки ригелей витража: посчитанные при построении (по правилам, до правок таблицы профилей)."""
+    """Марки ригелей витража: посчитанные при построении, включая разделение по пролётам."""
     return fac.marks or compute_marks(fac, system)
 
 

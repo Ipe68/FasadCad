@@ -21,6 +21,7 @@ BLOCK = "ФАСАД_КОНСТРУКЦИЯ"
 BLOCK_LAYER = "ФАСАД_КОНСТРУКЦИИ"     # не MARK_* - программа этот слой не стирает
 ROW_BLOCK = "ФАСАД_ПРОФИЛЬ"
 TABLE_LAYER = "ФАСАД_ПРОФИЛИ"         # таблицы профилей - программа стирает и рисует заново
+FILL_BLOCK = "ФАСАД_ЗАПОЛНЕНИЕ"       # строка таблицы замен заполнения (по марке стекла)
 
 # тег, подпись, значение по умолчанию, поле ObjectParams
 ATTRS = [
@@ -52,9 +53,12 @@ VERSION_TAG = "ВЕРСИЯ_4"      # скрытый атрибут: помен�
 BLOCK_W = W1 + W2
 # строка таблицы профилей: тег, x колонки, видимый
 ROW_ATTRS = [("МАРКА", 20, True), ("АРТИКУЛ", 520, True), ("ДЛИНА", 1020, True), ("КОЛ", 1320, True),
-             ("ВИТРАЖ", 20, False), ("БАЗА", 20, False)]
+             ("ВИТРАЖ", 20, False), ("БАЗА", 20, False), ("ПРОЛЕТ", 20, False)]
 ROW_W = 1500.0
 TABLE_GAP = 200.0                                    # от блока конструкции до таблицы
+# строка таблицы замен заполнения: тег, x колонки, видимый
+FILL_ATTRS = [("СТЕКЛО", 20, True), ("ЗАПОЛНЕНИЕ", 520, True), ("ФОРМУЛА", 820, True),
+              ("ВАРИАНТ", 1180, True), ("ВИТРАЖ", 20, False)]
 
 
 def _vla_block(name: str, ents: list[str], tags: list[str]) -> str:
@@ -97,8 +101,11 @@ def define_block_code() -> str:
     ents.append(_vla_attdef(20, -total_h + 20, H * 0.5, VERSION_TAG, "версия блока", "", False))
     row = [_vla_rect(0, -ROW, ROW_W, 0)]
     row += [_vla_attdef(x, -ROW + 20, H * 0.8, tag, tag.capitalize(), "", vis) for tag, x, vis in ROW_ATTRS]
+    fill = [_vla_rect(0, -ROW, ROW_W, 0)]
+    fill += [_vla_attdef(x, -ROW + 20, H * 0.8, tag, tag.capitalize(), "", vis) for tag, x, vis in FILL_ATTRS]
     return (f'(strcat {_vla_block(BLOCK, ents, [a[0] for a in ATTRS] + [VERSION_TAG])} " " '
-            f'{_vla_block(ROW_BLOCK, row, [a[0] for a in ROW_ATTRS])})')
+            f'{_vla_block(ROW_BLOCK, row, [a[0] for a in ROW_ATTRS])} " " '
+            f'{_vla_block(FILL_BLOCK, fill, [a[0] for a in FILL_ATTRS])})')
 
 
 def _vla_insert(name: str, layer: str, x: float, y: float, values: dict[str, str]) -> str:
@@ -149,6 +156,7 @@ def read_blocks_code() -> str:
   (setq fp (open {_s(AXES_FILE.as_posix())} "a") n 0)
   {_read_inserts(BLOCK, "K")}
   {_read_inserts(ROW_BLOCK, "P")}
+  {_read_inserts(FILL_BLOCK, "F")}
   (close fp)
   n)'''
 
@@ -158,7 +166,7 @@ def parse_blocks(lines: list[str], prefix: str = "K") -> list[tuple[float, float
     out, cur = [], None
     for ln in lines:
         head = ln.split(" ", 1)[0]
-        if head in ("K", "P"):
+        if head in ("K", "P", "F"):
             f = ln.split()
             cur = None
             if head == prefix:
@@ -187,6 +195,73 @@ def parse_profile_tables(lines: list[str]) -> dict[str, dict[str, tuple[str, tup
     return out
 
 
+def spans_code(spans: list[tuple[float, float, float]]) -> str:
+    return ";".join(f"{y:.3f},{xl:.3f},{xr:.3f}" for y, xl, xr in spans)
+
+
+def parse_profile_spans(lines: list[str]) -> dict[str, dict[str, list[tuple[float, float, float]]]]:
+    """Скрытый атрибут ПРОЛЕТ: закрепление марки за конкретными пролётами ригелей."""
+    out: dict[str, dict] = {}
+    for _, _, a, _ in parse_blocks(lines, "P"):
+        spans = []
+        for item in a.get("ПРОЛЕТ", "").split(";"):
+            try:
+                y, xl, xr = map(float, item.split(","))
+                spans.append((y, xl, xr))
+            except ValueError:
+                pass
+        for mark in a.get("МАРКА", "").split(","):
+            if mark.strip():
+                out.setdefault(a.get("ВИТРАЖ", ""), {})[mark.strip()] = spans
+    return out
+
+
+def add_profile_row_code(x: float, y: float, values: dict[str, str]) -> str:
+    """Временно добавить строку новой марки; сразу после этого таблица перестраивается по ровной сетке."""
+    return f'(progn {_layer(TABLE_LAYER, 4)} {_ms()} {_vla_insert(ROW_BLOCK, TABLE_LAYER, x, y, values)} "ок")'
+
+
+def set_fill_code(edits: list[tuple[str, str, str, str, str]], bx: float, by: float) -> str:
+    """LISP: записать замены заполнения строками ФАСАД_ЗАПОЛНЕНИЕ.
+    edits - [(витраж, стекло, заполнение, формула, вариант)]; существующую строку (витраж+стекло)
+    обновить, нет - вставить ниже таблицы профилей. Результат: "записей N (новых M)"."""
+    def s(t):
+        return '"' + t.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+    upd, ins = [], []
+    for k, (vitrage, mark, fill, formula, variant) in enumerate(edits):
+        vals = {"СТЕКЛО": mark, "ЗАПОЛНЕНИЕ": fill, "ФОРМУЛА": formula, "ВАРИАНТ": variant, "ВИТРАЖ": vitrage}
+        setv = " ".join(f'(setq a (assoc {s(k2)} av)) (if a (vla-put-TextString (cdr a) {s(v)}))'
+                        for k2, v in vals.items())
+        upd.append(f'((and (= vitrage {s(vitrage)}) (= steklo {s(mark)})) (progn {setv} (setq n (1+ n))))')
+        cons = " ".join(f"(cons {s(k2)} {s(v)})" for k2, v in vals.items())
+        y = by - 2500 - ROW * k
+        ins.append(f'((= i {k}) (progn '
+                   f'(setq o (vla-InsertBlock ms (vlax-3d-point {_n(bx + BLOCK_W + TABLE_GAP)} {_n(y)} 0) '
+                   f'{s(FILL_BLOCK)} 1 1 1 0)) (vla-put-Layer o {s(TABLE_LAYER)}) '
+                   f'(foreach a (vlax-invoke o (quote GetAttributes)) '
+                   f'(if (setq v (assoc (vla-get-TagString a) (list {cons}))) (vla-put-TextString a (cdr v)))) '
+                   f'(setq n (1+ n))))')
+    upd_cases = " ".join(upd)
+    ins_clauses = " ".join(ins)
+    return (f'(progn (vl-load-com) (setq n 0) '
+            f'(setq ms (vla-get-ModelSpace (vla-get-ActiveDocument (vlax-get-acad-object)))) '
+            f'(if (setq ss (ssget "_X" (list (cons 0 "INSERT") (cons 2 {s(FILL_BLOCK)}) (cons 410 "Model")))) '
+            f'(progn (setq i 0) '
+            f'(while (< i (sslength ss)) '
+            f'(setq en (ssname ss i) sub (entnext en) vitrage nil steklo nil av nil) '
+            f'(while (and sub (= "ATTRIB" (cdr (assoc 0 (setq ae (entget sub)))))) '
+            f'(cond ((= "ВИТРАЖ" (cdr (assoc 2 ae))) (setq vitrage (cdr (assoc 1 ae)))) '
+            f'((= "СТЕКЛО" (cdr (assoc 2 ae))) (setq steklo (cdr (assoc 1 ae))))) '
+            f'(setq av (cons (cons (cdr (assoc 2 ae)) (vlax-ename->vla-object sub)) av)) '
+            f'(setq sub (entnext sub))) '
+            f'(if (and vitrage steklo) (cond {upd_cases} (t nil))) '
+            f'(setq i (1+ i))))) '
+            f'(setq miss (- {len(edits)} n)) '
+            f'(setq i 0) (while (< i miss) (cond {ins_clauses} (t nil)) (setq i (1+ i))) '
+            f'(strcat "записей " (itoa n) " (новых " (itoa miss) ")"))')
+
+
 def set_profile_code(edits: list[tuple[str, str, str]]) -> str:
     """LISP: в таблицах профилей заменить артикул у строк заданных марок.
     edits - [(витраж, марка, новый артикул)]. Результат: "правок N"."""
@@ -212,10 +287,54 @@ def set_profile_code(edits: list[tuple[str, str, str]]) -> str:
             f'(strcat "правок " (itoa n)))')
 
 
+def parse_fill_tables(lines: list[str]) -> dict[str, dict[str, dict[str, str]]]:
+    """Таблицы замен заполнения: витраж -> {марка стекла: {заполнение, формула, вариант}}.
+    Строки-блоки ФАСАД_ЗАПОЛНЕНИЕ; марку стекла программа ставит при построении (Ст52_01 и т.п.)."""
+    out: dict[str, dict] = {}
+    for _, _, a, _ in parse_blocks(lines, "F"):
+        mark, vitrage = a.get("СТЕКЛО", "").strip(), a.get("ВИТРАЖ", "").strip()
+        if mark and vitrage:
+            out.setdefault(vitrage, {})[mark] = {
+                "заполнение": a.get("ЗАПОЛНЕНИЕ", "").strip(),
+                "формула": a.get("ФОРМУЛА", "").strip(),
+                "вариант": a.get("ВАРИАНТ", "").strip()}
+    return out
+
+
+def table_fills_code(x0: float, y_top: float, name: str, rows: list[dict]) -> str:
+    """LISP: таблица замен заполнения витража под таблицей профилей (x0 - её левый край, y_top - верх)."""
+    out = [_layer(TABLE_LAYER, 4), _ms()]
+
+    def txt(x, yy, h, s):
+        out.append(f'(entmake (list (cons 0 "TEXT") (cons 8 {_s(TABLE_LAYER)}) (list 10 {_n(x)} {_n(yy)} 0.0) '
+                   f'(cons 40 {_n(h)}) (cons 1 {_s(s)})))')
+
+    txt(x0 + 20, y_top - ROW + 20, H, f"Заполнения {name}")
+    y = y_top - ROW
+    for r in rows:
+        y -= ROW
+        vals = {"СТЕКЛО": r["стекло"], "ЗАПОЛНЕНИЕ": str(r["заполнение"]), "ФОРМУЛА": r["формула"],
+                "ВАРИАНТ": r["вариант"], "ВИТРАЖ": name}
+        out.append(_vla_insert(FILL_BLOCK, TABLE_LAYER, x0, y, vals))
+    return "(progn " + "\n".join(out) + " (princ))"
+
+
 def clear_tables_code() -> str:
-    """LISP: стереть таблицы профилей (свой слой программы)."""
-    return (f'(progn (if (setq ss (ssget "X" (list (cons 8 {_s(TABLE_LAYER)}) (cons 410 "Model")))) '
-            f'(command "_.ERASE" ss "")) (princ))')
+    """LISP: стереть только таблицы профилей, не удаляя остальные члены их групп."""
+    return (f'(progn (setq fasad_pick (getvar "PICKSTYLE")) (setvar "PICKSTYLE" 0) '
+            f'(if (setq ss (ssget "X" (list (cons 8 {_s(TABLE_LAYER)}) (cons 410 "Model")))) '
+            f'(command "_.ERASE" ss "")) (setvar "PICKSTYLE" fasad_pick) (princ))')
+
+
+def profile_table_rows(fac: Facade) -> list[dict]:
+    """Строки таблицы без объединения марок: каждую марку затем можно заменить отдельно."""
+    out = []
+    for row in fac.profile_rows:
+        marks = [m.strip() for m in row["марка"].split(",") if m.strip()]
+        count = row["кол"] // len(marks) if marks and row["кол"] % len(marks) == 0 else row["кол"]
+        for mark in marks:
+            out.append({**row, "марка": mark, "кол": count})
+    return out
 
 
 def table_code(bx: float, by: float, name: str, fac: Facade) -> str:
@@ -236,10 +355,11 @@ def table_code(bx: float, by: float, name: str, fac: Facade) -> str:
     for tag, x, vis in ROW_ATTRS:
         if vis:
             txt(x0 + x, y - ROW + 20, H * 0.8, {"КОЛ": "Кол."}.get(tag, tag.capitalize()))
-    for r in fac.profile_rows:
+    for r in profile_table_rows(fac):
         y -= ROW
+        spans = [(sy, xl, xr) for sy, xl, xr, m in fac.marks if m == r["марка"]]
         vals = {"МАРКА": r["марка"], "АРТИКУЛ": r["артикул"], "ДЛИНА": f'{r["длина"]:g}', "КОЛ": str(r["кол"]),
-                "ВИТРАЖ": name, "БАЗА": f'{r["база"][0]}|{r["база"][1]:g}'}
+                "ВИТРАЖ": name, "БАЗА": f'{r["база"][0]}|{r["база"][1]:g}', "ПРОЛЕТ": spans_code(spans)}
         out.append(_vla_insert(ROW_BLOCK, TABLE_LAYER, x0, y, vals))
     return "(progn " + "\n".join(out) + " (princ))"
 

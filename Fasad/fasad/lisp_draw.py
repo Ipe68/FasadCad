@@ -12,6 +12,7 @@ POST_AXIS_LAYER = "OSs"
 BEAM_AXIS_LAYER = "OSr"
 FALSE_AXIS_LAYER = "OSf"          # фальш-ригель (КПС 009) - за стеклом, стекло не делит
 OPENING_LAYER = "проемы"       # метки дверей/окон в ячейках: текст "ДВЕРЬ СТ71"
+SECTION_LAYER_USER = "FASAD_СЕЧЕНИЯ"  # линии добавленных сечений (В-В, Г-Г...) - программа не стирает
 
 
 def _s(text: str) -> str:
@@ -108,6 +109,11 @@ def read_axes_code() -> str:
     (repeat (setq i (sslength ss))
       (setq e (entget (ssname ss (setq i (1- i)))) p1 (cdr (assoc 10 e)))
       (write-line (strcat "T " (rtos (car p1) 2 4) " " (rtos (cadr p1) 2 4) " " (cdr (assoc 1 e))) fp)))
+  (if (setq ss (ssget "X" (list (cons 0 "LINE") (cons 8 {_s(SECTION_LAYER_USER)}) (cons 410 "Model"))))
+    (repeat (setq i (sslength ss))
+      (setq e (entget (ssname ss (setq i (1- i)))) p1 (cdr (assoc 10 e)) p2 (cdr (assoc 11 e)))
+      (write-line (strcat "S " (rtos (car p1) 2 4) " " (rtos (cadr p1) 2 4) " "
+                          (rtos (car p2) 2 4) " " (rtos (cadr p2) 2 4)) fp)))
   (close fp)
   n)'''
 
@@ -130,6 +136,16 @@ def parse_axes_file() -> list[Axis]:
     return out
 
 
+def parse_section_lines() -> list[tuple[float, float, float, float]]:
+    """Линии добавленных сечений (команда ДОБАВИТЬСЕЧЕНИЕ): (x1, y1, x2, y2)."""
+    out = []
+    for ln in _axes_lines():
+        if ln.startswith("S "):
+            f = ln.split()
+            out.append(tuple(map(float, f[1:5])))
+    return out
+
+
 def parse_markers() -> list[tuple[float, float, str]]:
     """Метки проёмов: (x, y, текст). Из MTEXT убираются коды форматирования."""
     out = []
@@ -149,11 +165,94 @@ def draw_marker_code(x: float, y: float, text: str, h: float = 80) -> str:
 
 GENERATED_LAYERS = "`#*,MARK_*"   # слои, которые рисует программа (` - экранирует #)
 
+AUX_LAYERS = ("MARK_OPEN", "MARK_ФАСАД_ДЕТАЛИ", "MARK_ФАСАД_ПОДКЛАДКИ",
+              "MARK_РАЗМЕРЫ", "FASAD_СЕЧЕНИЯ", "проемы")
+                                 # выключаются только вспомогательные объекты ФАСАДА; все слои сечений остаются включёнными
+
 
 def clear_generated_code() -> str:
-    """LISP: стереть только то, что нарисовала программа (слои #_..., ##_..., MARK_...)."""
-    return (f'(progn (if (setq ss (ssget "X" (list (cons 8 "{GENERATED_LAYERS}") (cons 410 "Model")))) '
-            f'(command "_.ERASE" ss "")) (princ))')
+    """LISP: стереть только объекты программы, не удаляя остальные члены их групп."""
+    return (f'(progn (setq fasad_pick (getvar "PICKSTYLE")) (setvar "PICKSTYLE" 0) '
+            f'(if (setq ss (ssget "X" (list (cons 8 "{GENERATED_LAYERS}") (cons 410 "Model")))) '
+            f'(command "_.ERASE" ss "")) (setvar "PICKSTYLE" fasad_pick) (princ))')
+
+
+def mark_start_code() -> str:
+    """LISP: запомнить последний объект чертежа - граница "новых" объектов витража (для группы)."""
+    return '(progn (setq fasad_m0 (entlast)) (princ))'
+
+
+def group_code(name: str, bbox: tuple[float, float, float, float],
+               table_rect: tuple[float, float, float, float] | None = None) -> str:
+    """LISP: собрать витраж в именованную группу: новые объекты (от fasad_m0) + оси витража +
+    метки проёмов + линии добавленных сечений + блок данных и таблицы (в table_rect).
+    Группа пересоздаётся: старая с тем же именем расформировывается. Результат: "ок"/"пусто"/"ошибка"."""
+    x0, y0, x1, y1 = bbox
+    x0, y0, x1, y1 = x0 - 1, y0 - 1, x1 + 1, y1 + 1   # допуск на округление координат AutoCAD
+    tx0, ty0, tx1, ty1 = table_rect if table_rect else (0.0, 0.0, 0.0, 0.0)
+    tx0, ty0, tx1, ty1 = tx0 - 1, ty0 - 1, tx1 + 1, ty1 + 1
+    return f'''
+(progn
+  (setq ss (ssadd) e (entnext fasad_m0))
+  (while e
+    (setq ed (entget e))
+    (if (and ed (assoc 0 ed) (not (member (cdr (assoc 0 ed)) '("ATTRIB" "SEQEND"))))
+      (ssadd e ss))
+    (setq e (entnext e)))
+  (if (setq sa (ssget "X" (list (cons 0 "LINE") (cons 8 "OSs,OSr,OSf") (cons 410 "Model"))))
+    (repeat (setq i (sslength sa))
+      (setq e (ssname sa (setq i (1- i))) ed (entget e) p1 (cdr (assoc 10 ed)) p2 (cdr (assoc 11 ed)))
+      (if (and (<= {_n(x0)} (min (car p1) (car p2))) (>= {_n(x1)} (max (car p1) (car p2)))
+               (<= {_n(y0)} (min (cadr p1) (cadr p2))) (>= {_n(y1)} (max (cadr p1) (cadr p2))))
+        (ssadd e ss))))
+  (if (setq sa (ssget "X" (list (cons 0 "TEXT,MTEXT") (cons 8 "проемы") (cons 410 "Model"))))
+    (repeat (setq i (sslength sa))
+      (setq e (ssname sa (setq i (1- i))) p1 (cdr (assoc 10 (entget e))))
+      (if (and (<= {_n(x0)} (car p1) {_n(x1)}) (<= {_n(y0)} (cadr p1) {_n(y1)}))
+        (ssadd e ss))))
+  (if (setq sa (ssget "X" (list (cons 0 "LINE") (cons 8 "FASAD_СЕЧЕНИЯ") (cons 410 "Model"))))
+    (repeat (setq i (sslength sa))
+      (setq e (ssname sa (setq i (1- i))) ed (entget e) p1 (cdr (assoc 10 ed)) p2 (cdr (assoc 11 ed)))
+      (if (or (and (<= {_n(x0 - 3000)} (car p1) {_n(x1 + 3000)}) (<= {_n(y0 - 3000)} (cadr p1) {_n(y1 + 3000)}))
+              (and (<= {_n(x0 - 3000)} (car p2) {_n(x1 + 3000)}) (<= {_n(y0 - 3000)} (cadr p2) {_n(y1 + 3000)})))
+        (ssadd e ss))))
+  (if (setq sa (ssget "X" (list (cons 0 "INSERT,TEXT,LWPOLYLINE") (cons 8 "ФАСАД_КОНСТРУКЦИИ,ФАСАД_ПРОФИЛИ")
+                                (cons 410 "Model"))))
+    (repeat (setq i (sslength sa))
+      (setq e (ssname sa (setq i (1- i))) ed (entget e) p1 (cdr (assoc 10 ed)) lay (cdr (assoc 8 ed)))
+      (if (and p1
+               (if (= lay "ФАСАД_КОНСТРУКЦИИ")
+                 (and (<= {_n(tx0)} (car p1) {_n(tx0 + 400)}) (<= {_n(ty1 - 200)} (cadr p1) {_n(ty1 + 200)}))
+                 (and (<= {_n(tx0)} (car p1) {_n(tx1)}) (<= {_n(ty0)} (cadr p1) {_n(ty1)}))))
+        (ssadd e ss))))
+  (if (> (sslength ss) 0)
+    (progn
+      (vl-load-com)
+      (setq groups (vla-get-Groups (vla-get-ActiveDocument (vlax-get-acad-object))) old nil)
+      (vlax-for g groups (if (= (vla-get-Name g) {_s(name)}) (setq old g)))
+      (if old (command "_.-GROUP" "_E" {_s(name)}))
+      (command "_.-GROUP" "_C" {_s(name)} "" ss "")
+      (setq made nil)
+      (vlax-for g groups (if (= (vla-get-Name g) {_s(name)}) (setq made g)))
+      (if made "ок" "ошибка группы"))
+    "пусто"))'''
+
+
+def finish_code() -> str:
+    """LISP: скрыть вспомогательные объекты фасада, показать сечения и марки, включить выбор групп."""
+    offs = "".join(
+        f'(if (setq lo (tblobjname "LAYER" {_s(nm)})) '
+        f'(progn (if (= {_s(nm)} (getvar "CLAYER")) (setvar "CLAYER" "0")) '
+        f'(setq ed (entget lo) c (cdr (assoc 62 ed))) '
+        f'(if (and c (> c 0)) (entmod (subst (cons 62 (- c)) (assoc 62 ed) ed))))) '
+        for nm in AUX_LAYERS)
+    ons = "".join(
+        f'(if (setq lo (tblobjname "LAYER" {_s(nm)})) '
+        f'(progn (setq ed (entget lo) c (cdr (assoc 62 ed))) '
+        f'(if (and c (< c 0)) (entmod (subst (cons 62 (- c)) (assoc 62 ed) ed))))) '
+        for nm in ("MARK_СЕЧЕНИЕ", "MARK_СЕЧЕНИЕ_СТЕКЛО", "MARK_РАЗРЕЗ", "MARK_ВЫНОСКИ", "MARK_ПОДКЛАДКИ",
+                   "MARK_S", "MARK_R", "MARK_GLASS"))
+    return f'(progn {offs}{ons}(setvar "PICKSTYLE" 1) (princ))'
 
 
 def draw_facade_code(fac: Facade, system: System, text_h: float = 50) -> str:
@@ -163,9 +262,18 @@ def draw_facade_code(fac: Facade, system: System, text_h: float = 50) -> str:
     f = system.card.get("оформление", {})
     text_h = f.get("высота_марки", 2.5) * f.get("масштаб", 20)
     parts = [p for p in fac.parts if p.draw]
+    visible_kinds = {system.card["стойка"]["тип"], system.card["ригель"]["тип"]}
+
+    def part_layer(p):
+        visible = p.kind in visible_kinds or p.kind.startswith("Фальш")
+        return f"#_{p.article}" if visible else "MARK_ФАСАД_ДЕТАЛИ"
+
     layers: dict[str, int] = {}
     for p in parts:
-        layers.setdefault(f"#_{p.article}", system.color(p.article))
+        if p.kind in visible_kinds or p.kind.startswith("Фальш"):
+            layers.setdefault(part_layer(p), system.color(p.article))
+    if any(part_layer(p) == "MARK_ФАСАД_ДЕТАЛИ" for p in parts):
+        layers["MARK_ФАСАД_ДЕТАЛИ"] = 8
     for g in fac.glasses:
         layers.setdefault(f"##_{g.kind}", system.color("стекло"))
     layers["MARK_GLASS"] = 3
@@ -173,8 +281,8 @@ def draw_facade_code(fac: Facade, system: System, text_h: float = 50) -> str:
     out += [_layer(name, color) for name, color in layers.items()]
     out += [_load_linetype(lt) for lt in sorted({p.linetype for p in parts if p.linetype})]
     lt_scale = system.card.get("чертеж", {}).get("масштаб_линии", 1.0)
-    out += [_poly(f"#_{p.article}", p.pts, p.linetype, lt_scale) if p.pts
-            else _rect(f"#_{p.article}", p.x0, p.y0, p.x1, p.y1, p.linetype, lt_scale) for p in parts]
+    out += [_poly(part_layer(p), p.pts, p.linetype, lt_scale) if p.pts
+            else _rect(part_layer(p), p.x0, p.y0, p.x1, p.y1, p.linetype, lt_scale) for p in parts]
     for i, g in enumerate(fac.glasses, 1):
         out.append(_rect(f"##_{g.kind}", g.x0, g.y0, g.x1, g.y1))
         cx, cy = (g.x0 + g.x1) / 2, (g.y0 + g.y1) / 2

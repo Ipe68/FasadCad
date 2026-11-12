@@ -153,7 +153,7 @@ def cell_geometry(group) -> dict | None:
         b1 = round(sum(s * h for s, h in weighted) / sum(h for _, h in weighted))
     else:
         b1 = round(sum(spacings) / len(spacings))
-    # расчётный ригель: максимум большей стороны (при равенстве - с большей меньшей)
+    # расчётный ригель - несущий самый большой пакет (НАД ним): l1 = над, l2 = под
     best = None
     for y, x1, x2, _ in beams:
         ry = round(y, 3)
@@ -171,7 +171,7 @@ def cell_geometry(group) -> dict | None:
             i = ys.index(ryy)
             above = ys[i + 1] - ryy if i + 1 < len(ys) else 0.0
             below = ryy - ys[i - 1] if i > 0 else 0.0
-            pair = (max(above, below), min(above, below))
+            pair = (above, below)             # l1 = пакет на ригеле, l2 = под ригелем
             if best is None or pair > best:
                 best = pair
     out = {"b1": b1, "b2": round(max(spacings) - 20), "h_m": round(max(p[2] - p[1] for p in posts))}
@@ -194,7 +194,8 @@ class Statics:
 
     # ---------- запуск ----------
 
-    def run(self, obj_name: str, t_glass: float | None, geom: dict | None = None) -> dict | None:
+    def run(self, obj_name: str, t_glass: float | None, geom: dict | None = None,
+            angle: float = 90.0) -> dict | None:
         """Открыть окно Lora и дождаться результата. None - расчёт не передан."""
         if not self.main.exists():
             raise RuntimeError(f"Не найдена программа Lora: {self.main}")
@@ -212,6 +213,7 @@ class Statics:
             inp["система"] = sys_lora
         if geom:
             inp["размеры"] = geom
+        inp["угол"] = angle
         self.path.write_text(json.dumps({"вход": inp}, ensure_ascii=False, indent=1),
                              encoding="utf-8")
         subprocess.run([self.python, str(self.main), "--фасад", str(self.path)])

@@ -14,14 +14,16 @@ from pathlib import Path
 from typing import Callable
 
 from .acad_link import Acad
-from .constructions import (ATTRS, BLOCK_ABOVE, assign_blocks, bbox, clear_tables_code, define_block_code, params_from_attrs,
-                            parse_blocks, parse_profile_tables, read_blocks_code, split_axes, table_code,
-                            write_block_code)
+from .constructions import (ATTRS, BLOCK_ABOVE, BLOCK_W, ROW, TABLE_GAP, assign_blocks, bbox, clear_tables_code,
+                            define_block_code, params_from_attrs, parse_blocks, parse_fill_tables,
+                            parse_profile_spans, parse_profile_tables, profile_table_rows, read_blocks_code, split_axes, table_code,
+                            table_fills_code, write_block_code)
 from .dims import DIM_LAYER, build_dims
 from .facade import FILLER_MODES, Facade, ObjectParams, System, build, load_system
 from .lisp_draw import (_axes_lines, clear_generated_code, dimstyle_code, draw_dims_code, draw_facade_code,
-                        draw_items_code, load_blocks_code, parse_axes_file, parse_markers, read_axes_code,
-                        zoom_all_code)
+                        draw_items_code, finish_code, group_code, load_blocks_code, mark_start_code,
+                        parse_axes_file, parse_markers, parse_section_lines,
+                        read_axes_code, zoom_all_code)
 from .marks import BEAM_MARK_LAYER, POST_MARK_LAYER, build_marks
 from .sections import build_on_facade, build_sections, layer_color
 
@@ -100,7 +102,14 @@ def postroit(acad: Acad, system: System, obj: ObjectParams, systems_dir: Path) -
     fac = build(axes, system, obj, markers)
     acad.run_lisp(clear_generated_code())
     fac.warnings += _prepare(acad, system, systems_dir)
+    acad.run_lisp(mark_start_code())
     made, failed = _draw_one(acad, system, obj, fac, systems_dir)
+    bb = (min(min(a.x1, a.x2) for a in axes), min(min(a.y1, a.y2) for a in axes),
+          max(max(a.x1, a.x2) for a in axes), max(max(a.y1, a.y2) for a in axes))
+    res = acad.run_lisp(group_code("FASAD", bb))
+    if res and res.strip() != "ок":
+        print(f"Группа не создана: {res}")
+    acad.run_lisp(finish_code())
     acad.run_lisp(zoom_all_code())
     print(f"В AutoCAD создано объектов: {made}" + (f", НЕ СОЗДАНО: {failed}" if failed else ""))
     for w in fac.warnings:
@@ -119,13 +128,19 @@ def _read_drawing(acad: Acad, reach: float):
     lines = _axes_lines()
     blocks = parse_blocks(lines)
     tables = parse_profile_tables(lines)
+    spans = parse_profile_spans(lines)
+    fills = parse_fill_tables(lines)
     groups = split_axes(axes, reach)
     owners = assign_blocks(groups, blocks)
-    print(f"Осей: {len(axes)}, витражей: {len(groups)}, блоков конструкций: {len(blocks)}, меток проёмов: {len(markers)}")
-    return groups, owners, markers, tables
+    sections = parse_section_lines()
+    print(f"Осей: {len(axes)}, витражей: {len(groups)}, блоков конструкций: {len(blocks)}, "
+          f"меток проёмов: {len(markers)}, линий сечений: {len(sections)}, "
+          f"замен заполнения: {sum(len(v) for v in fills.values())}")
+    return groups, owners, markers, tables, sections, fills, spans
 
 
-def _build_all(acad: Acad, system: System, groups, objs, positions, warns, markers, systems_dir: Path):
+def _build_all(acad: Acad, system: System, groups, objs, positions, warns, markers, systems_dir: Path,
+               sections=(), fills=None):
     """Построить и нарисовать все витражи + таблицы профилей. positions - точки блоков конструкций (или None)."""
     acad.run_lisp(clear_generated_code())
     acad.run_lisp(clear_tables_code())
@@ -142,19 +157,36 @@ def _build_all(acad: Acad, system: System, groups, objs, positions, warns, marke
         except ValueError as e:                     # нет варианта комплектации и т.п.
             print(f"{obj.имя}: НЕ ПОСТРОЕН - {e}")
             continue
+        fac.extra_sections = [s for s in sections
+                              if x0 - 100 < (s[0] + s[2]) / 2 < x1 + 100
+                              and y0 - 100 < (s[1] + s[3]) / 2 < y1 + 100]
         for gl in fac.glasses:
             glass_no += 1
             gl.mark = f"{gl.kind}_{glass_no:02d}"
         fac.warnings = warn + fac.warnings
+        acad.run_lisp(mark_start_code())
         m, f = _draw_one(acad, system, obj, fac, systems_dir)
         made, failed = made + m, failed + f
+        frows = (fills or {}).get(obj.имя)
         if pos:
             acad.run_lisp(table_code(pos[0], pos[1], obj.имя, fac))
+            if frows:
+                y_top = pos[1] - 2 * ROW - ROW * len(profile_table_rows(fac)) - ROW
+                rows = [{"стекло": m, **d} for m, d in sorted(frows.items())]
+                acad.run_lisp(table_fills_code(pos[0] + BLOCK_W + TABLE_GAP, y_top, obj.имя, rows))
+        rect = None
+        if pos:
+            rows_h = (4 + len(profile_table_rows(fac)) + len(frows or {})) * ROW + 400
+            rect = (pos[0] - 100, pos[1] - rows_h, pos[0] + BLOCK_W + TABLE_GAP + 3000, pos[1] + 100)
+        res = acad.run_lisp(group_code(f"FASAD_{obj.имя}", (x0, y0, x1, y1), rect))
+        if res and res.strip() != "ок":
+            print(f"  {obj.имя}: группа не создана ({res})")
         result.append((obj, fac))
         print(f"  {obj.имя} x{obj.количество}: стоек {len(fac.post_x)}, стёкол {len(fac.glasses)}, "
               f"заполнение {obj.заполнение}, {obj.вариант}")
         for w in fac.warnings:
             print(f"     ВНИМАНИЕ: {w}")
+    acad.run_lisp(finish_code())
     acad.run_lisp(zoom_all_code())
     print(f"В AutoCAD создано объектов: {made}" + (f", НЕ СОЗДАНО: {failed}" if failed else ""))
     for w in common:
@@ -164,7 +196,7 @@ def _build_all(acad: Acad, system: System, groups, objs, positions, warns, marke
 
 def postroit_vse(acad: Acad, system: System, defaults: ObjectParams, systems_dir: Path) -> list[tuple[ObjectParams, Facade]]:
     """Все витражи чертежа по блокам ФАСАД_КОНСТРУКЦИЯ, без окна (для опытов)."""
-    groups, owners, markers, tables = _read_drawing(acad, system.card["система"]["ширина_профиля"] + 1)
+    groups, owners, markers, tables, sections, fills, spans = _read_drawing(acad, system.card["система"]["ширина_профиля"] + 1)
     objs, positions, warns = [], [], []
     for k, (g, owner) in enumerate(zip(groups, owners), 1):
         if owner:
@@ -172,10 +204,11 @@ def postroit_vse(acad: Acad, system: System, defaults: ObjectParams, systems_dir
         else:
             obj, warn = defaults, [f"Нет блока {'ФАСАД_КОНСТРУКЦИЯ'} рядом - взяты параметры по умолчанию"]
             obj = replace(obj, имя=f"ВТ-{k}?")
-        objs.append(replace(obj, профили=tables.get(obj.имя, {})))
+        objs.append(replace(obj, профили=tables.get(obj.имя, {}), пролеты=spans.get(obj.имя, {}),
+                            заполнения=fills.get(obj.имя, {})))
         positions.append(owner[:2] if owner else None)
         warns.append(warn)
-    return _build_all(acad, system, groups, objs, positions, warns, markers, systems_dir)
+    return _build_all(acad, system, groups, objs, positions, warns, markers, systems_dir, sections, fills)
 
 
 def _thick(s) -> int | None:
@@ -203,7 +236,7 @@ def _choices(systems_dir: Path, system: System) -> dict:
     def kits(thick):
         t = _thick(thick)
         return [(r["Вариант"], f'термовставка {r["Термовставка"] or "нет"}, прижим {r["Прижим"]} (стр. {r["Стр."]})')
-                for r in system.kits if _thick(r["Толщина"]) == t]
+                for r in system.kits if _thick(r["Толщина"]) == t and not str(r["Вариант"]).startswith("Тяжелые")]
 
     def perims(thick):
         t = _thick(thick)
@@ -264,19 +297,25 @@ def postroit_s_oknom(acad: Acad, systems_dir: Path, out_dir: Path, system_name: 
     system = load_system(systems_dir, loaded)
     card = system.card
 
-    groups, owners, markers, tables = _read_drawing(acad, card["система"]["ширина_профиля"] + 1)
+    groups, owners, markers, tables, sections, fills, spans = _read_drawing(acad, card["система"]["ширина_профиля"] + 1)
     if not groups:
         print("В чертеже нет осей OSs / OSr - строить нечего")
         return None
+    # свежий чертёж (только оси, без блоков конструкций) - не восстанавливаем прошлые ответы и статику
+    fresh = not any(owner for _, owner in zip(groups, owners))
+    if fresh:
+        top = {"объект": "Объект", "система": system_name}
     by_card = {"СТОЙКА": card["стойка"]["артикул"], "РИГЕЛЬ": card["ригель"]["артикул"]}
     saved_file = out_dir / "исходные_данные.json"           # ответы окна - на случай, если блок не записался
-    saved = json.loads(saved_file.read_text(encoding="utf-8")) if saved_file.exists() else {}
+    saved = {} if fresh else (json.loads(saved_file.read_text(encoding="utf-8")) if saved_file.exists() else {})
     vitrages = []
     for k, (g, owner) in enumerate(zip(groups, owners), 1):
         x0, y0, x1, y1 = bbox(g)
         label = f"X {x0:.0f}..{x1:.0f}"
         attrs = {tag: default for tag, _, default, _ in ATTRS}
         attrs["ИМЯ"] = f"ВТ-{k}"
+        if fresh:
+            attrs["ФОРМУЛА"] = ""            # иначе формула по умолчанию разблокирует окно
         if owner:
             attrs.update({t: v for t, v in owner[2].items() if v != "" or t not in by_card})
         elif label in saved:
@@ -298,7 +337,7 @@ def postroit_s_oknom(acad: Acad, systems_dir: Path, out_dir: Path, system_name: 
     statics = Statics(system, out_dir) if lora_available() else None
     statics_geom = [cell_geometry(g) for g in groups] if statics else None
     answer = ask(vitrages, top, _choices(systems_dir, system), kit_ok, statics=statics,
-                 statics_geom=statics_geom)
+                 statics_geom=statics_geom, fresh=fresh)
     if answer is None:
         print("Отменено - ничего не построено")
         return None
@@ -320,11 +359,13 @@ def postroit_s_oknom(acad: Acad, systems_dir: Path, out_dir: Path, system_name: 
             warn.append(f"Блок исходных данных не записан в чертёж ({res}) - построено по данным окна")
             print(f"  {attrs.get('ИМЯ')}: блок не записан - {res}")
         old_name = owner[2].get("ИМЯ", "") if owner else ""
-        objs.append(replace(obj, профили=tables.get(old_name, {}) if old_name else {}))
+        objs.append(replace(obj, профили=tables.get(old_name, {}) if old_name else {},
+                            пролеты=spans.get(old_name, {}) if old_name else {},
+                            заполнения=fills.get(old_name, {}) if old_name else {}))
         positions.append(pos)
         warns.append(warn)
 
-    result = _build_all(acad, system, groups, objs, positions, warns, markers, systems_dir)
+    result = _build_all(acad, system, groups, objs, positions, warns, markers, systems_dir, sections, fills)
     from .dialog import report
     if not result:
         report("Фасад - не построено", ["Ни один витраж не построен."], [])

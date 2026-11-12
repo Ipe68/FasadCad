@@ -12,12 +12,20 @@ Fasad/__pycache__/
 Fasad/**/__pycache__/
 Fasad/выход/
 Fasad/архив/
+# база каталога: генерируется Собрать_базу.py (ФАСАДБАЗА), запасной путь без библиотеки
+Fasad/systems/КП50К_детали.dxf
+Fasad/systems/КП50К_узлы_каталог.json
 
 # --- Lora_2_2: служебное и сеансы ---
 Lora_2_2/__pycache__/
 Lora_2_2/save_data/
 Lora_2_2/audit_report.txt
 Lora_2_2/Пример отчета..pdf
+# выгрузки кнопки "Экспорт *.pdf" и снимок кода перед правками
+Lora_2_2/Отчёт_*.pdf
+Lora_2_2/data_handler.zip
+# образец расчёта: программа его не читает, логика перенесена в calculations.py
+Lora_2_2/СТАТИКА *.xlsx
 
 # --- Python ---
 __pycache__/

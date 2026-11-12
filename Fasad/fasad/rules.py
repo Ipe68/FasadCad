@@ -138,6 +138,7 @@ class Sample:
     cx: float = 0.0                # середина профиля в файле образцов
     cy: float = 0.0
     frame: Place | None = None     # система узла в файле
+    thick2: int = 0                # смешанный узел (сочетание заполнений): толщина меньшей стороны
 
 
 def _frame(origin, udir, vdir) -> Place:
@@ -243,12 +244,14 @@ def read_samples(path: Path, profiles: set[str]) -> tuple[list[Sample], Library]
             return to_local(base, Place(e.dxf.name, e.dxf.insert.x, e.dxf.insert.y, rot % 360, mir))
 
         gb = [loc_box(g[1]) for g in gl]
-        thick = round(gb[0][3] - gb[0][1])
+        widths = sorted({round(b[3] - b[1]) for b in gb})
+        thick = widths[-1]
+        thick2 = widths[0] if len(widths) > 1 else 0     # два стекла разной ширины - смешанный узел
         smp = Sample(pe.dxf.name, beam, thick, edge, where=f"x={(pb[0]+pb[2])/2:.0f}, y={(pb[1]+pb[3])/2:.0f}",
                      cx=(pb[0] + pb[2]) / 2, cy=(pb[1] + pb[3]) / 2, frame=base,
                      g_in=round(min(b[1] for b in gb), 3), g_out=round(max(b[3] for b in gb), 3),
                      g_lat=round(min(min(abs(b[0]), abs(b[2])) for b in gb), 3),
-                     profile_place=loc_place(pe))
+                     profile_place=loc_place(pe), thick2=thick2)
         for e, b in mine:
             if e.dxftype() == "INSERT":
                 smp.items.append(SampleItem(e.dxf.name, loc_place(e), loc_box(b), (e.dxf.insert.x, e.dxf.insert.y)))
